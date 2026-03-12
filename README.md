@@ -259,7 +259,7 @@ We build in the open. Here's where we are.
 
 | Feature | Status |
 |---------|--------|
-| Multi-Platform Gateway (Feishu / Telegram / Discord) | Phase 5-6 Done |
+| Multi-Platform Gateway (Feishu / Telegram) | Phase 5-6 Done |
 | External Agent Onboarding (A2A contract) | In Progress |
 | opencode Integration | Phase 1 Done |
 | Local Omni Perception (Qwen) | Spec |
@@ -599,7 +599,7 @@ pnpm dev
 
 | 功能 | 状态 |
 |------|------|
-| 多平台网关（飞书 / Telegram / Discord） | Phase 5-6 完成 |
+| 多平台网关（飞书 / Telegram） | Phase 5-6 完成 |
 | 外部 Agent 接入（A2A 契约） | 进行中 |
 | opencode 集成 | Phase 1 完成 |
 | 本地全感知（Qwen Omni） | 规划中 |
