@@ -1,0 +1,43 @@
+#!/usr/bin/env node
+/**
+ * Cat Café MCP Server — Signals Surface
+ * 只暴露 Signal Hunter 工具。
+ */
+
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { initCatCafeDir } from './utils/path-validator.js';
+import { registerSignalToolset } from './server-toolsets.js';
+
+function createBaseServer(name: string): McpServer {
+  return new McpServer({
+    name,
+    version: '0.1.0',
+  });
+}
+
+export function createSignalsServer(): McpServer {
+  const server = createBaseServer('cat-cafe-signals-mcp');
+  registerSignalToolset(server);
+  return server;
+}
+
+async function main(): Promise<void> {
+  initCatCafeDir();
+  const server = createSignalsServer();
+  const transport = new StdioServerTransport();
+  console.error('[cat-cafe-signals] MCP Server starting...');
+  await server.connect(transport);
+  console.error('[cat-cafe-signals] MCP Server running on stdio');
+}
+
+const isEntryPoint = process.argv[1]
+  && resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1]);
+if (isEntryPoint) {
+  main().catch((err) => {
+    console.error('[cat-cafe-signals] Fatal error:', err);
+    process.exit(1);
+  });
+}

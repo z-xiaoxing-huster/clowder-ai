@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* === Cat Cafe Design System Variables (from 暹罗猫) === */
+:root {
+  /* Base Colors */
+  --color-base-white: #FDF8F3;
+  --color-base-black: #1E1E24;
+
+  /* Opus (The Architect) - Purple */
+  --color-opus-primary: #9B7EBD;
+  --color-opus-light: #D4C1EC;
+  --color-opus-dark: #6D5A8C;
+  --color-opus-bg: #F3EAF8;
+
+  /* Codex (The Engineer) - Green */
+  --color-codex-primary: #5B8C5A;
+  --color-codex-light: #8FB98E;
+  --color-codex-dark: #3A5F39;
+  --color-codex-bg: #EAF6EA;
+
+  /* Gemini (The Creative) - Blue */
+  --color-gemini-primary: #5B9BD5;
+  --color-gemini-light: #9CC0E7;
+  --color-gemini-dark: #3A6FA5;
+  --color-gemini-bg: #EAF4FB;
+
+  /* DARE / 狸花猫 (Dragon Li) - Amber */
+  --color-dare-primary: #D4A76A;
+  --color-dare-light: #E8C99B;
+  --color-dare-dark: #8B6F47;
+  --color-dare-bg: #FBF5EC;
+
+  /* Owner (Shit Shoveler) - Coffee/Latte */
+  --color-owner-primary: #E29578;
+  --color-owner-light: #FFDDD2;
+  --color-owner-dark: #815B5B;
+  --color-owner-bg: #FFF5F2;
+
+  /* UI Tokens */
+  --bg-app: var(--color-base-white);
+  --text-primary: var(--color-base-black);
+  --text-secondary: #666666;
+  --border-radius-base: 16px;
+  --spacing-unit: 8px;
+}
+
+[data-theme="dark"] {
+  --bg-app: var(--color-base-black);
+  --text-primary: var(--color-base-white);
+  --text-secondary: #AAAAAA;
+  --color-opus-bg: rgba(155, 126, 189, 0.15);
+  --color-codex-bg: rgba(91, 140, 90, 0.15);
+  --color-gemini-bg: rgba(91, 155, 213, 0.15);
+  --color-dare-bg: rgba(212, 167, 106, 0.15);
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: var(--text-primary);
+  background: var(--bg-app);
+}
+
+/* === Mobile PWA: safe-area insets for notched devices === */
+@supports (padding-top: env(safe-area-inset-top)) {
+  .safe-area-top {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+}
+
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pulse-subtle {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.75; box-shadow: 0 0 8px rgba(245, 158, 11, 0.3); }
+}
+.animate-pulse-subtle { animation: pulse-subtle 2s ease-in-out infinite; }
+
+/* F097: Dark-theme table overrides for CLI output + Thinking bubbles */
+.cli-output-md thead { background: rgba(255, 255, 255, 0.06); }
+.cli-output-md th { border-color: rgba(255, 255, 255, 0.12); color: #CBD5E1; }
+.cli-output-md td { border-color: rgba(255, 255, 255, 0.08); color: #94A3B8; }
+.cli-output-md code { background: rgba(255, 255, 255, 0.08); color: #E2E8F0; }

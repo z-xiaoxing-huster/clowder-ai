@@ -1,0 +1,59 @@
+import { describe, expect, it } from 'vitest';
+import { buildCatOptions, buildWhisperOptions } from '@/components/chat-input-options';
+import type { CatData } from '@/hooks/useCatData';
+
+const FAKE_CATS: CatData[] = [
+  {
+    id: 'gemini',
+    displayName: '暹罗猫',
+    color: { primary: '#5B9BD5', secondary: '#D6E9F8' },
+    mentionPatterns: ['暹罗', '暹罗猫', 'gemini'],
+    provider: 'google',
+    defaultModel: 'gemini-3-pro',
+    avatar: '/avatars/gemini.png',
+    roleDescription: '视觉设计师',
+    personality: '活泼有创意',
+  },
+];
+
+const MIXED_CATS: CatData[] = [
+  ...FAKE_CATS,
+  {
+    id: 'opus-fast',
+    displayName: '布偶猫(快)',
+    color: { primary: '#9B7EBD', secondary: '#E8D5F5' },
+    mentionPatterns: [],
+    provider: 'anthropic',
+    defaultModel: 'opus-fast',
+    avatar: '/avatars/opus.png',
+    roleDescription: '快速变体',
+    personality: 'kind',
+  },
+];
+
+describe('chat input mention option labels', () => {
+  it('uses official 暹罗猫 label/insert for gemini option', () => {
+    const options = buildCatOptions(FAKE_CATS);
+    const geminiOption = options.find((opt) => opt.id === 'gemini');
+    expect(geminiOption).toBeDefined();
+    expect(geminiOption?.label).toBe('@暹罗猫');
+    expect(geminiOption?.insert).toBe('@暹罗 ');
+  });
+});
+
+describe('buildCatOptions vs buildWhisperOptions split', () => {
+  it('buildCatOptions filters out cats with empty mentionPatterns', () => {
+    const options = buildCatOptions(MIXED_CATS);
+    expect(options).toHaveLength(1);
+    expect(options[0].id).toBe('gemini');
+  });
+
+  it('buildWhisperOptions includes cats with empty mentionPatterns', () => {
+    const options = buildWhisperOptions(MIXED_CATS);
+    expect(options).toHaveLength(2);
+    const fast = options.find((o) => o.id === 'opus-fast');
+    expect(fast).toBeDefined();
+    expect(fast!.label).toBe('@布偶猫(快)');
+    expect(fast!.insert).toBe(''); // no mentionPatterns → empty insert
+  });
+});

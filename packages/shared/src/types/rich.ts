@@ -1,0 +1,143 @@
+/**
+ * F22: Rich Blocks 富消息系统 — 类型定义
+ *
+ * 富块是派生的交互组件（card / diff / checklist / media_gallery），
+ * 与 contentBlocks（LLM 原始输出）语义不同，存储在 extra.rich 中。
+ */
+
+// ── Block Kinds ─────────────────────────────────────────────
+
+export type RichBlockKind = 'card' | 'diff' | 'checklist' | 'media_gallery' | 'audio' | 'interactive';
+
+// ── Base ────────────────────────────────────────────────────
+
+export interface RichBlockBase {
+  /** Message-local stable id (e.g. "b1") */
+  id: string;
+  kind: RichBlockKind;
+  /** Schema version — always 1 for now */
+  v: 1;
+}
+
+// ── Concrete Blocks ─────────────────────────────────────────
+
+export interface RichCardBlock extends RichBlockBase {
+  kind: 'card';
+  title: string;
+  bodyMarkdown?: string;
+  tone?: 'info' | 'success' | 'warning' | 'danger';
+  fields?: Array<{ label: string; value: string }>;
+}
+
+export interface RichDiffBlock extends RichBlockBase {
+  kind: 'diff';
+  filePath: string;
+  /** Unified diff text */
+  diff: string;
+  languageHint?: string;
+}
+
+export interface RichChecklistBlock extends RichBlockBase {
+  kind: 'checklist';
+  title?: string;
+  items: Array<{ id: string; text: string; checked?: boolean }>;
+}
+
+export interface RichMediaGalleryBlock extends RichBlockBase {
+  kind: 'media_gallery';
+  title?: string;
+  items: Array<{ url: string; alt?: string; caption?: string }>;
+}
+
+/** F34: Audio block for TTS playback or audio content.
+ *  F34-b: When `text` is set, this is a voice message — backend auto-synthesizes
+ *  and fills `url` before storage. */
+export interface RichAudioBlock extends RichBlockBase {
+  kind: 'audio';
+  url: string;
+  /** F34-b: Voice message text (what the cat "said"). Present = voice message style. */
+  text?: string;
+  /** F085-P3: Override voice — use this cat's voice instead of the message sender's.
+   *  Enables multi-cat voice in a single message (e.g. three cats taking turns). */
+  speaker?: string;
+  title?: string;
+  durationSec?: number;
+  mimeType?: string;
+}
+
+/** F096: Interactive rich block — user can select/confirm within the block */
+export interface InteractiveOption {
+  id: string;
+  label: string;
+  emoji?: string;
+  /** SVG icon name from the café icon set — preferred over emoji for visual consistency */
+  icon?: string;
+  description?: string;
+  level?: number;
+  group?: string;
+  /** When true, selecting this option shows a text input for custom user input */
+  customInput?: boolean;
+  /** Placeholder text for the custom input field */
+  customInputPlaceholder?: string;
+}
+
+export interface RichInteractiveBlock extends RichBlockBase {
+  kind: 'interactive';
+  interactiveType: 'select' | 'multi-select' | 'card-grid' | 'confirm';
+  title?: string;
+  description?: string;
+  options: InteractiveOption[];
+  maxSelect?: number;
+  allowRandom?: boolean;
+  messageTemplate?: string;
+  disabled?: boolean;
+  selectedIds?: string[];
+  /** Phase C: blocks sharing the same groupId are submitted together */
+  groupId?: string;
+}
+
+// ── Union ───────────────────────────────────────────────────
+
+export type RichBlock =
+  | RichCardBlock
+  | RichDiffBlock
+  | RichChecklistBlock
+  | RichMediaGalleryBlock
+  | RichAudioBlock
+  | RichInteractiveBlock;
+
+// ── Container (stored in StoredMessage.extra.rich) ──────────
+
+export interface RichMessageExtra {
+  v: 1;
+  blocks: RichBlock[];
+}
+
+// ── Normalization (#85 format tolerance) ────────────────────
+
+const VALID_KINDS: readonly string[] = ['card', 'diff', 'checklist', 'media_gallery', 'audio', 'interactive'];
+
+/**
+ * #85: Normalize a raw rich block object (mutating).
+ * - `type → kind` alias: if object has `type` but not `kind`, and `type` is a valid kind → rename
+ * - Auto-fill `v: 1`: if object has `kind` but no `v` field → add `v: 1`
+ */
+export function normalizeRichBlock(raw: unknown): unknown {
+  if (!raw || typeof raw !== 'object') return raw;
+  const obj = raw as Record<string, unknown>;
+
+  // type → kind alias
+  if ('type' in obj && !('kind' in obj)) {
+    if (VALID_KINDS.includes(obj['type'] as string)) {
+      obj['kind'] = obj['type'];
+      delete obj['type'];
+    }
+  }
+
+  // Auto-fill v: 1
+  if (!('v' in obj) && 'kind' in obj) {
+    obj['v'] = 1;
+  }
+
+  return obj;
+}

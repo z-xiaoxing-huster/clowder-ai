@@ -1,0 +1,1214 @@
+import { CAT_CONFIGS } from '@cat-cafe/shared';
+import { create } from 'zustand';
+import type {
+  CatInvocationInfo,
+  CatStatusType,
+  ChatMessage,
+  ChatMessageMetadata,
+  GameState,
+  QueueEntry,
+  RichBlock,
+  Thread,
+  ThreadState,
+  TokenUsage,
+  ToolEvent,
+} from './chat-types';
+import { DEFAULT_THREAD_STATE } from './chat-types';
+
+// Re-export types so existing consumers keep working with `import { ... } from '@/stores/chatStore'`
+export type {
+  CatInvocationInfo,
+  CatStatusType,
+  ChatMessage,
+  ChatMessageMetadata,
+  EvidenceData,
+  EvidenceResultData,
+  ImageContent,
+  MessageContent,
+  GameState,
+  QueueEntry,
+  RichAudioBlock,
+  RichBlock,
+  RichBlockKind,
+  RichCardBlock,
+  RichChecklistBlock,
+  RichDiffBlock,
+  RichMediaGalleryBlock,
+  TextContent,
+  Thread,
+  ThreadState,
+  TokenUsage,
+  ToolEvent,
+} from './chat-types';
+export { DEFAULT_THREAD_STATE } from './chat-types';
+
+// ── Helpers ──
+
+/** Snapshot the flat active-thread fields into a ThreadState object */
+function snapshotActive(s: ChatState): ThreadState {
+  return {
+    messages: s.messages,
+    isLoading: s.isLoading,
+    isLoadingHistory: s.isLoadingHistory,
+    hasMore: s.hasMore,
+    hasActiveInvocation: s.hasActiveInvocation,
+    intentMode: s.intentMode,
+    targetCats: s.targetCats,
+    catStatuses: s.catStatuses,
+    catInvocations: s.catInvocations,
+    currentGame: s.currentGame,
+    unreadCount: 0, // active thread always 0
+    hasUserMention: false,
+    lastActivity: Date.now(),
+    queue: s.queue,
+    queuePaused: s.queuePaused,
+    queuePauseReason: s.queuePauseReason,
+    queueFull: s.queueFull,
+    queueFullSource: s.queueFullSource,
+  };
+}
+
+/** Flatten a ThreadState into partial ChatState fields */
+function flattenThread(ts: ThreadState): Partial<ChatState> {
+  return {
+    messages: ts.messages,
+    isLoading: ts.isLoading,
+    isLoadingHistory: ts.isLoadingHistory,
+    hasMore: ts.hasMore,
+    hasActiveInvocation: ts.hasActiveInvocation,
+    intentMode: ts.intentMode,
+    targetCats: ts.targetCats,
+    catStatuses: ts.catStatuses,
+    catInvocations: ts.catInvocations,
+    currentGame: ts.currentGame,
+    queue: ts.queue,
+    queuePaused: ts.queuePaused,
+    queuePauseReason: ts.queuePauseReason,
+    queueFull: ts.queueFull,
+    queueFullSource: ts.queueFullSource,
+  };
+}
+
+const MAX_BLOB_MESSAGES = 200;
+
+const UI_THINKING_EXPANDED_KEY = 'catcafe.ui.thinkingExpandedByDefault';
+
+function loadUiThinkingExpandedByDefault(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem(UI_THINKING_EXPANDED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function persistUiThinkingExpandedByDefault(next: boolean) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(UI_THINKING_EXPANDED_KEY, next ? '1' : '0');
+  } catch {
+    // ignore storage failures (privacy mode, quota, etc.)
+  }
+}
+
+function revokeBlobUrls(messages: ChatMessage[]) {
+  for (const msg of messages) {
+    if (msg.contentBlocks) {
+      for (const block of msg.contentBlocks) {
+        if (block.type === 'image' && block.url.startsWith('blob:')) {
+          URL.revokeObjectURL(block.url);
+        }
+      }
+    }
+  }
+}
+
+function collectBlobUrls(messages: ChatMessage[]): Set<string> {
+  const blobUrls = new Set<string>();
+  for (const msg of messages) {
+    if (!msg.contentBlocks) continue;
+    for (const block of msg.contentBlocks) {
+      if (block.type === 'image' && block.url.startsWith('blob:')) {
+        blobUrls.add(block.url);
+      }
+    }
+  }
+  return blobUrls;
+}
+
+function revokeRemovedBlobUrls(previousMessages: ChatMessage[], nextMessages: ChatMessage[]) {
+  const retainedBlobUrls = collectBlobUrls(nextMessages);
+  for (const msg of previousMessages) {
+    if (!msg.contentBlocks) continue;
+    for (const block of msg.contentBlocks) {
+      if (block.type === 'image' && block.url.startsWith('blob:') && !retainedBlobUrls.has(block.url)) {
+        URL.revokeObjectURL(block.url);
+      }
+    }
+  }
+}
+
+function replaceMessageIdInList(messages: ChatMessage[], fromId: string, toId: string): ChatMessage[] {
+  if (fromId === toId) return messages;
+  const fromIndex = messages.findIndex((msg) => msg.id === fromId);
+  if (fromIndex === -1) return messages;
+
+  if (messages.some((msg) => msg.id === toId)) {
+    return messages.filter((msg) => msg.id !== fromId);
+  }
+
+  return messages.map((msg) => (msg.id === fromId ? { ...msg, id: toId } : msg));
+}
+
+/** F067 Phase 2: Fire macOS notification when a cat @mentions the owner */
+function fireOwnerMentionNotification(msg: ChatMessage) {
+  if (typeof window === 'undefined' || !('Notification' in window)) return;
+  if (Notification.permission !== 'granted') {
+    Notification.requestPermission();
+    return;
+  }
+  const catConfig = CAT_CONFIGS[msg.catId ?? ''];
+  const catName = catConfig?.displayName ?? msg.catId ?? '猫猫';
+  const preview = typeof msg.content === 'string' ? msg.content.replace(/\n/g, ' ').slice(0, 120) : '';
+  new Notification(`🐾 ${catName} @ 了你`, {
+    body: preview,
+    icon: catConfig?.avatar ?? '/favicon.ico',
+    tag: `owner-mention-${msg.id}`,
+  });
+}
+
+function updateThreadMessage(
+  state: ChatState,
+  threadId: string,
+  messageId: string,
+  updater: (message: ChatMessage) => ChatMessage,
+): ChatState | Partial<ChatState> {
+  if (threadId === state.currentThreadId) {
+    return {
+      messages: state.messages.map((m) => (m.id === messageId ? updater(m) : m)),
+    };
+  }
+
+  const existing = state.threadStates[threadId];
+  if (!existing) return state;
+  return {
+    threadStates: {
+      ...state.threadStates,
+      [threadId]: {
+        ...existing,
+        messages: existing.messages.map((m) => (m.id === messageId ? updater(m) : m)),
+        lastActivity: Date.now(),
+      },
+    },
+  };
+}
+
+// ── Store interface ──
+
+interface ChatState {
+  // Per-thread state (flat — reflects the active thread for backward compat)
+  messages: ChatMessage[];
+  isLoading: boolean;
+  isLoadingHistory: boolean;
+  hasMore: boolean;
+  /** Whether the thread has an active invocation (broader than isLoading — stays true during A2A chains) */
+  hasActiveInvocation: boolean;
+  intentMode: 'execute' | 'ideate' | null;
+  targetCats: string[];
+  catStatuses: Record<string, CatStatusType>;
+  catInvocations: Record<string, CatInvocationInfo>;
+  /** F101: Active game in current thread */
+  currentGame: GameState | null;
+  /** F39: Message queue entries */
+  queue: QueueEntry[];
+  /** F39: Whether the queue is paused */
+  queuePaused: boolean;
+  /** F39: Pause reason */
+  queuePauseReason?: 'canceled' | 'failed';
+  /** F39: Queue full flag */
+  queueFull: boolean;
+  /** F39: Who triggered the full warning */
+  queueFullSource?: 'user' | 'connector';
+
+  // Multi-thread state map (preserves per-thread state across switches)
+  threadStates: Record<string, ThreadState>;
+
+  // Multi-thread UI
+  viewMode: 'single' | 'split';
+  splitPaneThreadIds: string[];
+  splitPaneTargetId: string | null;
+
+  // Global state
+  currentThreadId: string;
+  currentProjectPath: string;
+  /** Transient: suppress initThreadUnread re-hydration for recently-cleared threads */
+  _unreadSuppressedUntil: Record<string, number>;
+  threads: Thread[];
+  isLoadingThreads: boolean;
+  /** UI: Whether Thinking blocks should be expanded by default (global preference). */
+  uiThinkingExpandedByDefault: boolean;
+
+  // ── Active-thread actions (operate on flat state) ──
+  addMessage: (msg: ChatMessage) => void;
+  removeMessage: (id: string) => void;
+  prependHistory: (msgs: ChatMessage[], hasMore: boolean) => void;
+  replaceMessages: (msgs: ChatMessage[], hasMore: boolean) => void;
+  replaceMessageId: (fromId: string, toId: string) => void;
+  appendToLastMessage: (content: string) => void;
+  appendToMessage: (id: string, content: string) => void;
+  appendToolEvent: (id: string, event: ToolEvent) => void;
+  /** F22: Append a rich block to a message */
+  appendRichBlock: (id: string, block: RichBlock) => void;
+  /** F096: Update a specific rich block within a message */
+  updateRichBlock: (messageId: string, blockId: string, patch: Record<string, unknown>) => void;
+  setStreaming: (id: string, streaming: boolean) => void;
+  setLoading: (loading: boolean) => void;
+  setHasActiveInvocation: (v: boolean) => void;
+  setLoadingHistory: (loading: boolean) => void;
+  setIntentMode: (mode: 'execute' | 'ideate' | null) => void;
+  setTargetCats: (cats: string[]) => void;
+  setCatStatus: (catId: string, status: CatStatusType) => void;
+  clearCatStatuses: () => void;
+  setCatInvocation: (catId: string, info: Partial<CatInvocationInfo>) => void;
+  setMessageUsage: (messageId: string, usage: TokenUsage) => void;
+  /** Merge metadata onto an active-thread message (parallel to setThreadMessageMetadata) */
+  setMessageMetadata: (messageId: string, metadata: ChatMessageMetadata) => void;
+  /** F045: Set or append extended thinking content on an assistant message */
+  setMessageThinking: (messageId: string, thinking: string) => void;
+  /** F081: Persist stream invocation identity onto a message for replace/hydration reconcile */
+  setMessageStreamInvocation: (messageId: string, invocationId: string) => void;
+  clearMessages: () => void;
+  /** F101: Update current game state */
+  setCurrentGame: (game: GameState | null) => void;
+
+  // ── Thread management ──
+  setThreads: (threads: Thread[]) => void;
+  setCurrentThread: (threadId: string) => void;
+  setCurrentProject: (projectPath: string) => void;
+  setLoadingThreads: (loading: boolean) => void;
+  updateThreadTitle: (threadId: string, title: string) => void;
+  updateThreadPin: (threadId: string, pinned: boolean) => void;
+  updateThreadFavorite: (threadId: string, favorited: boolean) => void;
+  updateThreadThinkingMode: (threadId: string, mode: 'debug' | 'play') => void;
+
+  updateThreadPreferredCats: (threadId: string, preferredCats: string[]) => void;
+  setUiThinkingExpandedByDefault: (next: boolean) => void;
+
+  // ── Multi-thread actions (new) ──
+  addMessageToThread: (threadId: string, msg: ChatMessage) => void;
+  replaceThreadMessageId: (threadId: string, fromId: string, toId: string) => void;
+  appendToThreadMessage: (threadId: string, messageId: string, content: string) => void;
+  appendToolEventToThread: (threadId: string, messageId: string, event: ToolEvent) => void;
+  setThreadCatInvocation: (threadId: string, catId: string, info: Partial<CatInvocationInfo>) => void;
+  setThreadMessageMetadata: (threadId: string, messageId: string, metadata: ChatMessageMetadata) => void;
+  setThreadMessageUsage: (threadId: string, messageId: string, usage: TokenUsage) => void;
+  setThreadMessageThinking: (threadId: string, messageId: string, thinking: string) => void;
+  setThreadMessageStreamInvocation: (threadId: string, messageId: string, invocationId: string) => void;
+  setThreadMessageStreaming: (threadId: string, messageId: string, streaming: boolean) => void;
+  setThreadLoading: (threadId: string, loading: boolean) => void;
+  setThreadHasActiveInvocation: (threadId: string, active: boolean) => void;
+  setThreadIntentMode: (threadId: string, mode: 'execute' | 'ideate' | null) => void;
+  setThreadTargetCats: (threadId: string, cats: string[]) => void;
+  getThreadState: (threadId: string) => ThreadState;
+  incrementUnread: (threadId: string) => void;
+  clearUnread: (threadId: string) => void;
+  /** F072: Clear unread badges for all threads at once */
+  clearAllUnread: () => void;
+  /** F069: Initialize unread state from API (page load recovery) */
+  initThreadUnread: (threadId: string, unreadCount: number, hasUserMention: boolean) => void;
+  updateThreadCatStatus: (threadId: string, catId: string, status: CatStatusType) => void;
+  /** Batch content-append + metadata + streaming + catStatus into a single set() to prevent
+   *  React update-depth overflow during high-frequency background streaming. */
+  batchStreamChunkUpdate: (params: {
+    threadId: string;
+    messageId: string;
+    catId: string;
+    content: string;
+    metadata?: ChatMessageMetadata;
+    streaming: boolean;
+    catStatus: CatStatusType;
+  }) => void;
+  setViewMode: (mode: 'single' | 'split') => void;
+  setSplitPaneThreadIds: (ids: string[]) => void;
+  setSplitPaneTarget: (threadId: string | null) => void;
+
+  /** Clear hasActiveInvocation for a specific thread (active or background) */
+  clearThreadActiveInvocation: (threadId: string) => void;
+  /** Clear invocation-scoped UI state for a specific thread (active or background) */
+  resetThreadInvocationState: (threadId: string) => void;
+
+  // ── F39: Queue actions ──
+  setQueue: (threadId: string, queue: QueueEntry[]) => void;
+  setQueuePaused: (threadId: string, paused: boolean, reason?: 'canceled' | 'failed') => void;
+  setQueueFull: (threadId: string, source: 'user' | 'connector') => void;
+  /** F098-D: Mark queued messages as delivered (set deliveredAt on matching messages) */
+  markMessagesDelivered: (threadId: string, messageIds: string[], deliveredAt: number) => void;
+
+  // ── F63: Workspace Explorer ──
+  rightPanelMode: 'status' | 'workspace';
+  workspaceWorktreeId: string | null;
+  workspaceOpenTabs: string[];
+  workspaceOpenFilePath: string | null;
+  workspaceOpenFileLine: number | null;
+  workspaceEditToken: string | null;
+  workspaceEditTokenExpiry: number | null;
+  setRightPanelMode: (mode: 'status' | 'workspace') => void;
+  setWorkspaceWorktreeId: (id: string | null) => void;
+  setWorkspaceOpenFile: (path: string | null, line?: number | null, worktreeId?: string | null) => void;
+  closeWorkspaceTab: (path: string) => void;
+  restoreWorkspaceTabs: (tabs: string[], openFile: string | null) => void;
+  setWorkspaceEditToken: (token: string | null, expiresIn?: number) => void;
+
+  // ── F63-AC15: Code-to-chat reference ──
+  pendingChatInsert: { threadId: string; text: string } | null;
+  setPendingChatInsert: (insert: { threadId: string; text: string } | null) => void;
+
+  // ── Hub modal (F12) ──
+  hubState: { open: boolean; tab?: string } | null;
+  openHub: (tab?: string) => void;
+  closeHub: () => void;
+
+  // ── F079: Vote modal ──
+  showVoteModal: boolean;
+  setShowVoteModal: (show: boolean) => void;
+}
+
+export const useChatStore = create<ChatState>((set, get) => ({
+  messages: [],
+  isLoading: false,
+  isLoadingHistory: false,
+  hasMore: true,
+  hasActiveInvocation: false,
+  intentMode: null,
+  targetCats: [],
+  catStatuses: {},
+  catInvocations: {},
+  currentGame: null,
+  queue: [],
+  queuePaused: false,
+  queueFull: false,
+
+  threadStates: {},
+  viewMode: 'single',
+  splitPaneThreadIds: [],
+  splitPaneTargetId: null,
+
+  currentThreadId: 'default',
+  currentProjectPath: 'default',
+  _unreadSuppressedUntil: {},
+  threads: [],
+  isLoadingThreads: false,
+  uiThinkingExpandedByDefault: loadUiThinkingExpandedByDefault(),
+
+  setUiThinkingExpandedByDefault: (next) => {
+    persistUiThinkingExpandedByDefault(next);
+    set({ uiThinkingExpandedByDefault: next });
+  },
+
+  // ── F39: Queue actions ──
+
+  setQueue: (threadId, queue) =>
+    set((state) => {
+      const wasFull = threadId === state.currentThreadId ? state.queueFull : state.threadStates[threadId]?.queueFull;
+      const isShrinking = wasFull && queue.length < 5; // MAX_QUEUE_DEPTH=5, clear full flag when below
+      if (threadId === state.currentThreadId) {
+        return {
+          queue,
+          queuePaused: queue.length === 0 ? false : state.queuePaused,
+          ...(isShrinking ? { queueFull: false, queueFullSource: undefined } : {}),
+        };
+      }
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            queue,
+            queuePaused: queue.length === 0 ? false : existing.queuePaused,
+            ...(isShrinking ? { queueFull: false, queueFullSource: undefined } : {}),
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  setQueuePaused: (threadId, paused, reason) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) {
+        return { queuePaused: paused, queuePauseReason: paused ? reason : undefined };
+      }
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            queuePaused: paused,
+            queuePauseReason: paused ? reason : undefined,
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  setQueueFull: (threadId, source) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) {
+        return { queueFull: true, queueFullSource: source };
+      }
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            queueFull: true,
+            queueFullSource: source,
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  markMessagesDelivered: (threadId, messageIds, deliveredAt) =>
+    set((state) => {
+      const idSet = new Set(messageIds);
+      const updateMsgs = (msgs: ChatMessage[]) =>
+        msgs.map((m) => (idSet.has(m.id) ? { ...m, deliveredAt } : m));
+
+      if (threadId === state.currentThreadId) {
+        return { messages: updateMsgs(state.messages) };
+      }
+      const existing = state.threadStates[threadId];
+      if (!existing) return state;
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: { ...existing, messages: updateMsgs(existing.messages) },
+        },
+      };
+    }),
+
+  // ── F63: Workspace Explorer ──
+  rightPanelMode: 'status' as const,
+  workspaceWorktreeId: null,
+  workspaceOpenTabs: [],
+  workspaceOpenFilePath: null,
+  workspaceOpenFileLine: null,
+  workspaceEditToken: null,
+  workspaceEditTokenExpiry: null,
+  setRightPanelMode: (mode) => set({ rightPanelMode: mode }),
+  setWorkspaceWorktreeId: (id) => set({ workspaceWorktreeId: id, workspaceOpenTabs: [], workspaceOpenFilePath: null, workspaceOpenFileLine: null, workspaceEditToken: null, workspaceEditTokenExpiry: null }),
+  setWorkspaceOpenFile: (path, line, targetWorktreeId) => {
+    if (path) {
+      // Switch worktree if a different one is specified
+      if (targetWorktreeId && targetWorktreeId !== get().workspaceWorktreeId) {
+        set({
+          workspaceWorktreeId: targetWorktreeId,
+          workspaceOpenTabs: [path],
+          workspaceOpenFilePath: path,
+          workspaceOpenFileLine: line ?? null,
+          workspaceEditToken: null,
+          workspaceEditTokenExpiry: null,
+          rightPanelMode: 'workspace',
+        });
+      } else {
+        const tabs = get().workspaceOpenTabs;
+        const newTabs = tabs.includes(path) ? tabs : [...tabs, path];
+        set({
+          workspaceOpenTabs: newTabs,
+          workspaceOpenFilePath: path,
+          workspaceOpenFileLine: line ?? null,
+          rightPanelMode: 'workspace',
+        });
+      }
+    } else {
+      set({
+        workspaceOpenFilePath: null,
+        workspaceOpenFileLine: null,
+      });
+    }
+  },
+  closeWorkspaceTab: (path) => {
+    const { workspaceOpenTabs: tabs, workspaceOpenFilePath: active } = get();
+    const newTabs = tabs.filter((t) => t !== path);
+    if (active === path) {
+      const idx = tabs.indexOf(path);
+      const next = newTabs[Math.min(idx, newTabs.length - 1)] ?? null;
+      set({ workspaceOpenTabs: newTabs, workspaceOpenFilePath: next, workspaceOpenFileLine: null });
+    } else {
+      set({ workspaceOpenTabs: newTabs });
+    }
+  },
+  restoreWorkspaceTabs: (tabs, openFile) => {
+    set({
+      workspaceOpenTabs: tabs,
+      workspaceOpenFilePath: openFile,
+      workspaceOpenFileLine: null,
+      workspaceEditToken: null,
+      workspaceEditTokenExpiry: null,
+    });
+  },
+  setWorkspaceEditToken: (token, expiresIn) =>
+    set({
+      workspaceEditToken: token,
+      workspaceEditTokenExpiry: token && expiresIn ? Date.now() + expiresIn * 1000 : null,
+    }),
+
+  // ── F63-AC15: Code-to-chat reference ──
+  pendingChatInsert: null,
+  setPendingChatInsert: (insert) => set({ pendingChatInsert: insert }),
+
+  hubState: null,
+  openHub: (tab) => set({ hubState: { open: true, tab } }),
+  closeHub: () => set({ hubState: null }),
+  showVoteModal: false,
+  setShowVoteModal: (show) => set({ showVoteModal: show }),
+
+  // ── Active-thread actions ──
+
+  addMessage: (msg) =>
+    set((state) => {
+      if (state.messages.some((m) => m.id === msg.id)) return state;
+      const messages = [...state.messages, msg];
+      if (messages.length > MAX_BLOB_MESSAGES) {
+        revokeBlobUrls(messages.slice(0, messages.length - MAX_BLOB_MESSAGES));
+      }
+      // F067: Notify on active thread when user is not focused
+      if (msg.mentionsUser && typeof document !== 'undefined' && !document.hasFocus()) {
+        fireOwnerMentionNotification(msg);
+      }
+      return { messages };
+    }),
+
+  removeMessage: (id) =>
+    set((state) => ({
+      messages: state.messages.filter((m) => m.id !== id),
+    })),
+
+  prependHistory: (msgs, hasMore) =>
+    set((state) => {
+      const existingIds = new Set(state.messages.map((m) => m.id));
+      const newMsgs = msgs.filter((m) => !existingIds.has(m.id));
+      return { messages: [...newMsgs, ...state.messages], hasMore };
+    }),
+
+  replaceMessages: (msgs, hasMore) =>
+    set((state) => {
+      revokeRemovedBlobUrls(state.messages, msgs);
+      return { messages: msgs, hasMore };
+    }),
+
+  replaceMessageId: (fromId, toId) =>
+    set((state) => {
+      const nextMessages = replaceMessageIdInList(state.messages, fromId, toId);
+      if (nextMessages === state.messages) return state;
+      revokeRemovedBlobUrls(state.messages, nextMessages);
+      return { messages: nextMessages };
+    }),
+
+  appendToLastMessage: (content) =>
+    set((state) => {
+      const messages = [...state.messages];
+      const last = messages[messages.length - 1];
+      if (last && last.type === 'assistant') {
+        messages[messages.length - 1] = { ...last, content: last.content + content };
+      }
+      return { messages };
+    }),
+
+  appendToMessage: (id, content) =>
+    set((state) => ({
+      messages: state.messages.map((m) => (m.id === id ? { ...m, content: m.content + content } : m)),
+    })),
+
+  appendToolEvent: (id, event) =>
+    set((state) => ({
+      messages: state.messages.map((m) => (m.id === id ? { ...m, toolEvents: [...(m.toolEvents ?? []), event] } : m)),
+    })),
+
+  appendRichBlock: (id, block) =>
+    set((state) => ({
+      messages: state.messages.map((m) => {
+        if (m.id !== id) return m;
+        const rich = m.extra?.rich ?? { v: 1 as const, blocks: [] };
+        // Defensive dedup by block.id (server already deduplicates, this is a safety net)
+        if (rich.blocks.some((b: { id: string }) => b.id === block.id)) return m;
+        return { ...m, extra: { ...m.extra, rich: { ...rich, blocks: [...rich.blocks, block] } } };
+      }),
+    })),
+
+  /** F096: Update a specific rich block within a message (e.g. set disabled + selectedIds) */
+  updateRichBlock: (messageId: string, blockId: string, patch: Record<string, unknown>) =>
+    set((state) => ({
+      messages: state.messages.map((m) => {
+        if (m.id !== messageId || !m.extra?.rich?.blocks) return m;
+        return {
+          ...m,
+          extra: {
+            ...m.extra,
+            rich: {
+              ...m.extra.rich,
+              blocks: m.extra.rich.blocks.map((b) =>
+                b.id === blockId ? { ...b, ...patch } : b,
+              ),
+            },
+          },
+        };
+      }),
+    })),
+
+  setStreaming: (id, streaming) =>
+    set((state) => ({
+      messages: state.messages.map((m) => (m.id === id ? { ...m, isStreaming: streaming } : m)),
+    })),
+
+  setLoading: (loading) => set({ isLoading: loading }),
+  setHasActiveInvocation: (v) => set({ hasActiveInvocation: v }),
+  setLoadingHistory: (loading) => set({ isLoadingHistory: loading }),
+  setIntentMode: (mode) => set({ intentMode: mode }),
+
+  setTargetCats: (cats) =>
+    set({ targetCats: cats, catStatuses: Object.fromEntries(cats.map((c) => [c, 'pending' as const])) }),
+
+  setCatStatus: (catId, status) => set((state) => ({ catStatuses: { ...state.catStatuses, [catId]: status } })),
+
+  clearCatStatuses: () => set({ targetCats: [], catStatuses: {} }),
+
+  setCatInvocation: (catId, info) =>
+    set((state) => ({
+      catInvocations: {
+        ...state.catInvocations,
+        [catId]: { ...state.catInvocations[catId], ...info },
+      },
+    })),
+
+  setMessageUsage: (messageId, usage) =>
+    set((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === messageId && m.metadata ? { ...m, metadata: { ...m.metadata, usage } } : m,
+      ),
+    })),
+
+  setMessageMetadata: (messageId, metadata) => {
+    // Skip if message already has metadata (avoid per-chunk re-render during streaming)
+    const msg = get().messages.find((m) => m.id === messageId);
+    if (msg?.metadata) return;
+    set((state) => ({
+      messages: state.messages.map((m) => (m.id === messageId ? { ...m, metadata } : m)),
+    }));
+  },
+
+  setMessageThinking: (messageId, thinking) =>
+    set((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === messageId ? { ...m, thinking: m.thinking ? `${m.thinking}\n\n---\n\n${thinking}` : thinking } : m,
+      ),
+    })),
+
+  setMessageStreamInvocation: (messageId, invocationId) =>
+    set((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === messageId
+          ? {
+            ...m,
+            extra: {
+              ...m.extra,
+              stream: { ...m.extra?.stream, invocationId },
+            },
+          }
+          : m,
+      ),
+    })),
+
+  clearMessages: () =>
+    set((state) => {
+      revokeBlobUrls(state.messages);
+      return { messages: [], hasMore: true };
+    }),
+
+  setCurrentGame: (game) => set({ currentGame: game }),
+
+  // ── Thread management ──
+
+  setThreads: (threads) => set({ threads }),
+  setCurrentProject: (projectPath) => set({ currentProjectPath: projectPath }),
+  setLoadingThreads: (loading) => set({ isLoadingThreads: loading }),
+
+  updateThreadTitle: (threadId, title) =>
+    set((state) => ({
+      threads: state.threads.map((t) => (t.id === threadId ? { ...t, title } : t)),
+    })),
+
+  updateThreadPin: (threadId, pinned) =>
+    set((state) => ({
+      threads: state.threads.map((t) =>
+        t.id === threadId ? { ...t, pinned, pinnedAt: pinned ? Date.now() : null } : t,
+      ),
+    })),
+
+  updateThreadFavorite: (threadId, favorited) =>
+    set((state) => ({
+      threads: state.threads.map((t) =>
+        t.id === threadId ? { ...t, favorited, favoritedAt: favorited ? Date.now() : null } : t,
+      ),
+    })),
+
+  updateThreadThinkingMode: (threadId, mode) =>
+    set((state) => ({
+      threads: state.threads.map((t) => (t.id === threadId ? { ...t, thinkingMode: mode } : t)),
+    })),
+
+  updateThreadPreferredCats: (threadId, preferredCats) =>
+    set((state) => ({
+      threads: state.threads.map((t) =>
+        t.id === threadId ? { ...t, preferredCats: preferredCats.length > 0 ? preferredCats : undefined } : t,
+      ),
+    })),
+
+  /**
+   * Switch active thread.
+   * Saves current flat state into threadStates map, then restores the target thread's state.
+   * This is the key mechanism that preserves per-thread state across switches.
+   */
+  setCurrentThread: (threadId) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) return state;
+
+      // Save current flat state to map
+      const saved = snapshotActive(state);
+      // Load target thread state (or defaults for first visit)
+      const loaded = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+
+      return {
+        currentThreadId: threadId,
+        threadStates: {
+          ...state.threadStates,
+          [state.currentThreadId]: saved,
+        },
+        ...flattenThread(loaded),
+      };
+    }),
+
+  // ── Multi-thread actions ──
+
+  /** Add a message to a specific thread (for background thread socket updates) */
+  addMessageToThread: (threadId, msg) =>
+    set((state) => {
+      // Active thread — delegate to flat state
+      if (threadId === state.currentThreadId) {
+        if (state.messages.some((m) => m.id === msg.id)) return state;
+        const messages = [...state.messages, msg];
+        if (messages.length > MAX_BLOB_MESSAGES) {
+          revokeBlobUrls(messages.slice(0, messages.length - MAX_BLOB_MESSAGES));
+        }
+        // F067: Notify even on active thread when tab is not focused
+        // document.hidden is false when switching macOS apps (only true for tab switch/minimize)
+        // document.hasFocus() correctly returns false when another app is in foreground
+        if (msg.mentionsUser && typeof document !== 'undefined' && !document.hasFocus()) {
+          fireOwnerMentionNotification(msg);
+        }
+        return { messages };
+      }
+
+      // Background thread — update map + increment unread
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      if (existing.messages.some((m) => m.id === msg.id)) return state;
+
+      // F067 Phase 2: Fire macOS notification for @owner mention
+      if (msg.mentionsUser) fireOwnerMentionNotification(msg);
+
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            messages: [...existing.messages, msg],
+            unreadCount: existing.unreadCount + 1,
+            hasUserMention: existing.hasUserMention || !!msg.mentionsUser,
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  replaceThreadMessageId: (threadId, fromId, toId) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) {
+        const nextMessages = replaceMessageIdInList(state.messages, fromId, toId);
+        if (nextMessages === state.messages) return state;
+        revokeRemovedBlobUrls(state.messages, nextMessages);
+        return { messages: nextMessages };
+      }
+
+      const existing = state.threadStates[threadId];
+      if (!existing) return state;
+
+      const nextMessages = replaceMessageIdInList(existing.messages, fromId, toId);
+      if (nextMessages === existing.messages) return state;
+      revokeRemovedBlobUrls(existing.messages, nextMessages);
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            messages: nextMessages,
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  /** Append chunk content to a specific message in a specific thread. */
+  appendToThreadMessage: (threadId, messageId, content) =>
+    set((state) =>
+      updateThreadMessage(state, threadId, messageId, (m) => ({
+        ...m,
+        content: m.content + content,
+      })),
+    ),
+
+  /** Append tool event to a specific assistant message in a specific thread. */
+  appendToolEventToThread: (threadId, messageId, event) =>
+    set((state) =>
+      updateThreadMessage(state, threadId, messageId, (m) => ({
+        ...m,
+        toolEvents: [...(m.toolEvents ?? []), event],
+      })),
+    ),
+
+  /** Set/merge cat invocation info for a specific thread (active or background). */
+  setThreadCatInvocation: (threadId, catId, info) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) {
+        return {
+          catInvocations: {
+            ...state.catInvocations,
+            [catId]: { ...state.catInvocations[catId], ...info },
+          },
+        };
+      }
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            catInvocations: {
+              ...existing.catInvocations,
+              [catId]: { ...existing.catInvocations[catId], ...info },
+            },
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  /** Set/merge metadata on a specific message in a specific thread (active or background). */
+  setThreadMessageMetadata: (threadId, messageId, metadata) =>
+    set((state) =>
+      updateThreadMessage(state, threadId, messageId, (m) => ({
+        ...m,
+        metadata: m.metadata ? { ...m.metadata, ...metadata } : metadata,
+      })),
+    ),
+
+  /** Set usage on a specific message in a specific thread (active or background). */
+  setThreadMessageUsage: (threadId, messageId, usage) =>
+    set((state) =>
+      updateThreadMessage(state, threadId, messageId, (m) =>
+        m.metadata ? { ...m, metadata: { ...m.metadata, usage } } : m,
+      ),
+    ),
+
+  /** F045: Set/append extended thinking on an assistant message in a background thread. */
+  setThreadMessageThinking: (threadId, messageId, thinking) =>
+    set((state) =>
+      updateThreadMessage(state, threadId, messageId, (m) => ({
+        ...m,
+        thinking: m.thinking ? `${m.thinking}\n\n---\n\n${thinking}` : thinking,
+      })),
+    ),
+
+  setThreadMessageStreamInvocation: (threadId, messageId, invocationId) =>
+    set((state) =>
+      updateThreadMessage(state, threadId, messageId, (m) => ({
+        ...m,
+        extra: {
+          ...m.extra,
+          stream: { ...m.extra?.stream, invocationId },
+        },
+      })),
+    ),
+
+  /** Update isStreaming for a specific message in a specific thread. */
+  setThreadMessageStreaming: (threadId, messageId, streaming) =>
+    set((state) =>
+      updateThreadMessage(state, threadId, messageId, (m) => ({
+        ...m,
+        isStreaming: streaming,
+      })),
+    ),
+
+  /** Update isLoading for a specific thread (active or background). */
+  setThreadLoading: (threadId, loading) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) {
+        return { isLoading: loading };
+      }
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            isLoading: loading,
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  /** Update hasActiveInvocation for a specific thread (active or background). */
+  setThreadHasActiveInvocation: (threadId, active) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) {
+        return { hasActiveInvocation: active };
+      }
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            hasActiveInvocation: active,
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  /** Update intentMode for a specific thread (active or background).
+   *  Also resets catStatuses — new intent mode = new invocation = fresh statuses. */
+  setThreadIntentMode: (threadId, mode) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) {
+        return { intentMode: mode, catStatuses: {} };
+      }
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            intentMode: mode,
+            catStatuses: {},
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  /** Update targetCats for a specific thread (active or background).
+   *  Also pre-seeds catStatuses with 'pending' — mirrors active setTargetCats
+   *  so ThreadCatStatus renders the working indicator immediately. */
+  setThreadTargetCats: (threadId, cats) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) {
+        return { targetCats: cats, catStatuses: Object.fromEntries(cats.map((c) => [c, 'pending' as const])) };
+      }
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            targetCats: cats,
+            catStatuses: Object.fromEntries(cats.map((c) => [c, 'pending' as const])),
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  /** Get a thread's state (active thread returns flat state, others return map) */
+  getThreadState: (threadId) => {
+    const state = get();
+    if (threadId === state.currentThreadId) return snapshotActive(state);
+    return state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+  },
+
+  incrementUnread: (threadId) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) return state;
+      const ts = state.threadStates[threadId];
+      if (!ts) return state;
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: { ...ts, unreadCount: ts.unreadCount + 1 },
+        },
+      };
+    }),
+
+  clearUnread: (threadId) =>
+    set((state) => {
+      const ts = state.threadStates[threadId];
+      if (!ts || (ts.unreadCount === 0 && !ts.hasUserMention)) return state;
+      // Suppress re-hydration from API for 10s to prevent ack race
+      const suppressUntil = Date.now() + 10_000;
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: { ...ts, unreadCount: 0, hasUserMention: false },
+        },
+        _unreadSuppressedUntil: {
+          ...state._unreadSuppressedUntil,
+          [threadId]: suppressUntil,
+        },
+      };
+    }),
+
+  clearAllUnread: () =>
+    set((state) => {
+      const updated: Record<string, ThreadState> = {};
+      const suppressUntil = Date.now() + 10_000;
+      const suppressed: Record<string, number> = { ...state._unreadSuppressedUntil };
+      let changed = false;
+      for (const [tid, ts] of Object.entries(state.threadStates)) {
+        if (ts.unreadCount > 0 || ts.hasUserMention) {
+          updated[tid] = { ...ts, unreadCount: 0, hasUserMention: false };
+          suppressed[tid] = suppressUntil;
+          changed = true;
+        } else {
+          updated[tid] = ts;
+        }
+      }
+      return changed ? { threadStates: updated, _unreadSuppressedUntil: suppressed } : state;
+    }),
+
+  initThreadUnread: (threadId, unreadCount, hasUserMention) =>
+    set((state) => {
+      if (threadId === state.currentThreadId) return state;
+      // Skip re-hydration if this thread was recently cleared (ack race suppression)
+      const suppressUntil = state._unreadSuppressedUntil[threadId];
+      if (suppressUntil && Date.now() < suppressUntil) return state;
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      if (existing.unreadCount === unreadCount && existing.hasUserMention === hasUserMention) return state;
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: { ...existing, unreadCount, hasUserMention },
+        },
+      };
+    }),
+
+  /** Update a specific cat's status in a background thread (for sidebar indicators) */
+  updateThreadCatStatus: (threadId, catId, status) =>
+    set((state) => {
+      // Active thread — update flat catStatuses directly
+      if (threadId === state.currentThreadId) {
+        return { catStatuses: { ...state.catStatuses, [catId]: status } };
+      }
+      // Background thread — update in map
+      const existing = state.threadStates[threadId] ?? { ...DEFAULT_THREAD_STATE };
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            catStatuses: { ...existing.catStatuses, [catId]: status },
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  batchStreamChunkUpdate: ({ threadId, messageId, catId, content, metadata, streaming, catStatus }) =>
+    set((state) => {
+      const applyMessageUpdate = (m: ChatMessage): ChatMessage => {
+        if (m.id !== messageId) return m;
+        return {
+          ...m,
+          content: m.content + content,
+          ...(metadata ? { metadata: m.metadata ? { ...m.metadata, ...metadata } : metadata } : {}),
+          isStreaming: streaming,
+        };
+      };
+
+      if (threadId === state.currentThreadId) {
+        return {
+          messages: state.messages.map(applyMessageUpdate),
+          catStatuses: { ...state.catStatuses, [catId]: catStatus },
+        };
+      }
+
+      const existing = state.threadStates[threadId];
+      if (!existing) return state;
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...existing,
+            messages: existing.messages.map(applyMessageUpdate),
+            catStatuses: { ...existing.catStatuses, [catId]: catStatus },
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  /** Clear hasActiveInvocation for a specific thread (active or background) */
+  clearThreadActiveInvocation: (threadId) =>
+    set((state) => {
+      // Active thread — clear flat state
+      if (threadId === state.currentThreadId) {
+        return { hasActiveInvocation: false };
+      }
+      // Background thread — update in threadStates map (no-op if unknown)
+      const ts = state.threadStates[threadId];
+      if (!ts) return state;
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: { ...ts, hasActiveInvocation: false },
+        },
+      };
+    }),
+
+  /** Clear invocation-scoped UI state for a specific thread (active or background) */
+  resetThreadInvocationState: (threadId) =>
+    set((state) => {
+      const resetPatch = {
+        isLoading: false,
+        hasActiveInvocation: false,
+        intentMode: null,
+        targetCats: [] as string[],
+        catStatuses: {} as Record<string, CatStatusType>,
+      };
+
+      // Active thread — clear flat state
+      if (threadId === state.currentThreadId) {
+        return resetPatch;
+      }
+
+      // Background thread — update in threadStates map (no-op if unknown)
+      const ts = state.threadStates[threadId];
+      if (!ts) return state;
+      return {
+        threadStates: {
+          ...state.threadStates,
+          [threadId]: {
+            ...ts,
+            ...resetPatch,
+            lastActivity: Date.now(),
+          },
+        },
+      };
+    }),
+
+  setViewMode: (mode) => set({ viewMode: mode }),
+  setSplitPaneThreadIds: (ids) => set({ splitPaneThreadIds: ids }),
+  setSplitPaneTarget: (threadId) => set({ splitPaneTargetId: threadId }),
+}));

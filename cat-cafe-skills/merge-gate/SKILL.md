@@ -1,0 +1,242 @@
+---
+name: merge-gate
+description: >
+  合入 main 的完整流程：门禁检查 → PR → 云端 review → squash merge → Phase 文档同步 → 清理。
+  Use when: reviewer 放行后准备合入、开 PR、触发云端 review、准备 merge。
+  Not for: 开发中、review 未通过、自检未完成。
+  Output: PR merged + worktree cleaned。
+triggers:
+  - "合入 main"
+  - "merge"
+  - "准备合入"
+  - "开 PR"
+  - "cloud review"
+  - "gh pr create"
+---
+
+# Merge Gate
+
+合入 main 的完整流程：门禁检查 → PR → 云端 review → squash merge → 清理。
+
+## 核心知识
+
+### 门禁 4 硬条件（全部满足才能开 PR）
+
+1. Reviewer 有**明确放行信号**（"放行"/"LGTM"/"通过"/"可以合入"）
+2. **所有 P1/P2** 已修复且经 reviewer 确认
+3. Review 针对**当前分支/当前工作**（不是历史 review）
+4. BACKLOG 涉及条目已在 feature branch 上标 `[x]`
+
+### 合入方式（唯一正确做法）
+
+```bash
+# 1. Push feature branch
+git push origin {branch}
+
+# 2. 开 PR（读 refs/pr-template.md 获取 body 模板，用 HEREDOC 填写）
+gh pr create --title "feat(xxx): ..." --body "$(cat <<'EOF'
+... 按 refs/pr-template.md 模板填写 ...
+EOF
+)"
+
+# 3. 注册 PR tracking（必做，Email Watcher / review 通知路由依赖）
+# → 调用 MCP: cat_cafe_register_pr_tracking(repoFullName, prNumber, catId)
+
+# 4. PR body 防呆检查（禁止任何 @句柄出现在 body）
+PR_BODY="$(gh pr view {PR_NUMBER} --json body --jq '.body')" || \
+  { echo "❌ 无法读取 PR body，停止流程"; exit 1; }
+printf '%s\n' "$PR_BODY" | rg -q '@[A-Za-z0-9_-]+ review' && \
+  { echo "❌ 不合规：云端 review 触发句柄只能写在 comment，不能写在 body"; exit 1; }
+printf '%s\n' "$PR_BODY" | rg -q '@(codex|chatgpt-codex-connector|gpt52|opus|sonnet|gemini)\b' && \
+  { echo "❌ 不合规：PR body 禁止出现任何 @句柄（含 HTML 注释中的签名）"; exit 1; }
+
+# 5. 触发云端 review（在 PR comment 中，不是 body！）
+HEAD_SHA="$(gh pr view {PR_NUMBER} --json headRefOid --jq '.headRefOid')" || \
+  { echo "❌ 无法读取 PR head sha，停止流程"; exit 1; }
+SHORT_SHA="${HEAD_SHA:0:8}"
+
+# 5.1 去重防呆（同一 commit 只允许触发一次；新 commit 允许再次触发）
+TRIGGER_URL="$(gh pr view {PR_NUMBER} --json comments | jq -r --arg sha "$SHORT_SHA" '
+  .comments[]
+  | select(.body | contains("Please review latest commit \($sha) for P1/P2 only."))
+  | .url
+' | head -n 1)"
+[ -n "$TRIGGER_URL" ] && \
+  { echo "❌ 已对 commit ${SHORT_SHA} 触发过 cloud review: ${TRIGGER_URL}"; exit 1; }
+
+TRIGGER_COMMENT_BODY="$(cat <<'EOF'
+{按 refs/pr-template.md 的“云端 Review 触发 Comment 模板”填写}
+EOF
+)"
+gh pr comment {PR_NUMBER} --body "$TRIGGER_COMMENT_BODY"
+# ⚠️ 完整模板见 refs/pr-template.md「云端 Review 触发 Comment 模板」
+
+# 6. 等云端 review（事件驱动，不轮询）
+#
+# 6.1 👀 接单检测（触发后 5 分钟查一次）
+TRIGGER_COMMENT_ID=”$(gh api repos/{OWNER}/{REPO}/issues/{PR_NUMBER}/comments \
+  --jq “[.[] | select(.body | contains(\”$SHORT_SHA\”))] | last | .id”)”
+EYES=”$(gh api repos/{OWNER}/{REPO}/issues/comments/${TRIGGER_COMMENT_ID}/reactions \
+  --jq '[.[] | select(.content == “eyes”)] | length')”
+#   - EYES > 0 → 云端已接单 → 停止监控，PR tracking 会自动通知结果
+#   - EYES == 0 → 云端没接到 → 允许 re-trigger（进 6.2）
+#
+# 6.2 允许再次触发的条件（满足任一即可）：
+#     a. HEAD SHA 变化（有新 commit）
+#     b. 触发 comment 存在但 5 分钟后仍无 👀 reaction
+#     c. 明确确认第一次触发失败（例如 comment 未发出/被删除）
+#     其它情况一律禁止二次触发
+
+# 7. Squash merge（GitHub 处理，禁止本地 squash！）
+gh pr merge {PR_NUMBER} --squash --delete-branch
+
+# 7.5 Phase 文档同步（每次 merge 必做！）🔴
+# → 见下方「Phase 文档同步」章节
+
+# 8. 更新本地 + 清理
+git checkout main && git pull origin main
+git worktree remove ../cat-cafe-{feature-name}
+git branch -d {branch-name} && git worktree prune
+```
+
+### 云端 review 处理规则
+
+| 结果 | 处理 |
+|------|------|
+| 0 P1/P2 | 通过，执行 Step 7 |
+| P1/P2 有复现证据 | 在 feature branch 修 → push → **re-trigger review** → 等通过 |
+| P1/P2 无复现证据 | 降级 P3，留 comment，视为通过 |
+| 误报 | 留 comment 解释，视为通过 |
+
+### Phase 文档同步（Step 7.5）🔴
+
+**为什么在 merge-gate 而不是 feat-lifecycle close**：一个 Feature 拆 N 个 Phase/PR，如果等 close 才更新文档，中间所有 session 冷启动读到的都是过时状态。**每次 merge 都是一次增量文档同步。**
+
+**流程**：
+
+1. **识别 Feature**：从 PR title/branch name 提取 `F{NNN}`（如 `feat/f088-phase-c`）
+   - 没有 Feature ID → 跳过（纯 TD/hotfix 不需要）
+
+2. **更新 feature doc** `docs/features/F{NNN}-*.md`：
+   - **Phase 状态**：本 PR 对应的 Phase 标记从 📋/🚧 → ✅
+   - **AC 打勾**：本 PR 实际完成的 AC 项 `[ ]` → `[x]`
+   - **Timeline**：加一行 `| {YYYY-MM-DD} | Phase {X} merged (PR #{N}) |`
+   - **Status 行**：如果是第一个 Phase 完成，`spec` → `in-progress`
+   - **不做**：不动 Dependencies/Risk/Links 等（那些是 kickoff/completion 的事）
+
+3. **Commit**：`docs(F{NNN}): sync phase progress after PR #{N} merge`
+   - 如果 merge 在 worktree 清理前完成，在 main 上直接 commit
+   - 这是文档同步，不需要走 review
+
+**检查清单**：
+- [ ] Feature doc 里本 Phase 标 ✅
+- [ ] 相关 AC 打勾
+- [ ] Timeline 有 merge 记录
+- [ ] Status 行与实际进度一致
+
+## Quick Reference
+
+| 条件 | 检查方式 |
+|------|---------|
+| Reviewer 放行？ | 搜索明确信号词 |
+| P1/P2 清零？ | 检查 review 记录 |
+| BACKLOG 更新？ | `grep '\[x\]' docs/BACKLOG.md` |
+| 云端通过？ | `gh pr checks {PR}` |
+| Phase 文档同步？ | feature doc Phase ✅ + AC 打勾 + Timeline 有记录 |
+
+## Common Mistakes
+
+| 错误 | 正确 |
+|------|------|
+| PR body 里写了云端 review 触发句柄 | 在 PR **comment** 里写（body 里写会触发代码修改权限而非 review） |
+| PR body 或 HTML 注释里写了 `@句柄`（例如签名） | **PR body 禁止任何 @句柄**，签名改为纯文本（如 `codex` / `gpt52`） |
+| 同一个 commit 连续发多条触发 comment | 先做 Step 5.1 去重检查；只有新 commit 才 re-trigger |
+| 触发后立刻轮询或手动重触发 | 5 分钟后查 👀（Step 6.1）；有 👀 = PR tracking 自动通知，不用管；无 👀 = 允许 re-trigger |
+| 修了 P1 不 re-trigger review | 修完 push 后**必须重新触发**云端 review |
+| 本地 `git rebase -i` 手动 squash | 用 `gh pr merge --squash`（GitHub 处理） |
+| 本地 merge 后 `gh pr close` | `gh pr close` = 放弃，`gh pr merge` = 合入 |
+| 不等云端 review 直接合入 | 必须等 0 P1/P2 |
+| Merge 后不更新 feature doc | Step 7.5 Phase 文档同步（每次 merge 必做！） |
+
+### **⚠️⚠️ 反面案例（PR #160）— 必须记住**
+
+**错误行为**：
+- PR description 里签名写了 `(@句柄)`（在 HTML 注释里）
+- 后续说明评论又写了 `@句柄`
+
+**后果**：
+- 触发了 `chatgpt-codex-connector` 的“Create an environment”自动回复
+- 云端 review 没有实际执行，流程被噪声污染
+
+**硬规则（加粗执行）**：
+- **PR body（含 HTML 注释）禁止出现任何 `@句柄`**
+- **只允许在专用触发 comment 里使用标准触发模板（见 refs/pr-template.md）**
+
+## 常见 QA（云端 Review 触发）
+
+### Q1: 出现 "Create an environment for this repo"，是不是 review 没权限？
+
+**不是。**
+
+**⚠️ THIS IS NOT A REVIEW-PERMISSION ERROR. THIS MESSAGE IS ABOUT CODE-WRITE ENVIRONMENT PERMISSION.**
+
+触发这个提示通常代表：
+- 你用了错误句柄（例如 `@chatgpt-codex-connector review`）
+- 或者把触发语句放错位置（body/非模板 comment）
+
+正确做法：
+- 只在 PR comment 使用 `refs/pr-template.md` 的标准触发模板（含短 SHA 与 P1/P2 约束）
+- 先跑去重检查（Step 5.1），同一 SHA 不重复触发
+
+### Q2: PR 里看到小眼睛（👀）是什么意思？
+
+**小眼睛 = 云端 reviewer 已接单/已看到触发。**
+
+**⚠️ EYES ICON MEANS "REQUEST RECEIVED", NOT "FAILED".**
+
+它不是失败信号，也不等于环境错误。后续是否通过，以 review comment / findings 为准。
+
+### Q3: 触发后多久需要再操作？
+
+默认 **不操作**。
+
+- **5 分钟后查一次 👀**（Step 6.1）：有 👀 = 已接单，PR tracking 会自动通知，猫猫不用管
+- **无 👀** = 云端没接到 → 允许 re-trigger
+- 有 👀 的情况下严禁重复触发
+
+### Q4: 云端 reviewer 没猫粮了怎么办？
+
+云端 Codex 的"代码审查"额度独立于总额度，可能单独耗尽。此时降级到其他猫做 **完整 PR review**（不是跳过 review！）：
+
+| 原 reviewer | 降级到 | 说明 |
+|-------------|--------|------|
+| 缅因猫 Codex | 缅因猫 GPT-5.4 | 同族不同个体 |
+| 缅因猫 GPT-5.4 | 缅因猫 Codex | 反向降级 |
+| 布偶猫某个体 | 布偶猫其他个体 / 缅因猫 | 同族或跨族 |
+| **禁止** | 暹罗猫 | 不做代码 review（孟加拉猫 Opus 除外，底层是 Opus） |
+
+**铁律：降级后仍须校验"reviewer ≠ 作者"**——降级表是建议顺序，不能覆盖 self-review 禁令。
+
+操作：`gh pr comment {PR} --body "..."` 用标准触发模板 @ 降级 reviewer（句柄查 `cat-config.json`）。
+
+## 和其他 skill 的区别
+
+- `quality-gate`: 自检（在 review 之前）
+- `request-review` / `receive-review`: review 循环（在 merge 之前）
+- **本 skill**: review 通过后的合入全流程
+
+## 下一步
+
+合入后判断 feature 规模：
+
+**最后一个 Phase（或小 Feature）** → **直接加载 `feat-lifecycle` completion**（§17）：
+1. 自己做愿景三问
+2. 自动 @ **非 reviewer、非作者**的猫做愿景守护（查 roster 动态选，不能 hardcode）
+3. 守护猫放行 → close feat
+4. 守护猫踢回 → 修改后重新走 quality-gate
+
+**中间 Phase（大 Feature，3+ Phase）** → Phase 文档同步（Step 7.5 已做）+ **主动碰头team lead**：
+1. 成果展示（截图 / demo / 关键改动）
+2. 愿景进度（哪些 AC ✅ 了）
+3. 下个 Phase 方向 + 新发现
+4. "方向对吗？" → team lead确认 → 继续下一个 Phase

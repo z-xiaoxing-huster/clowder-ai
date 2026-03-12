@@ -1,0 +1,184 @@
+/**
+ * F34: TTS Routes
+ *
+ * POST /api/tts/synthesize — Synthesize text to speech, returns audioUrl
+ * GET  /api/tts/audio/:filename — Download audio file (auth-gated)
+ */
+
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { stat as fsStat, mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import type { TtsSynthesizeRequest } from '@cat-cafe/shared';
+import type { FastifyInstance, FastifyPluginOptions } from 'fastify';
+import { z } from 'zod';
+import { getCatVoice } from '../config/cat-voices.js';
+import type { TtsRegistry } from '../domains/cats/services/tts/TtsRegistry.js';
+import { resolveUserId } from '../utils/request-identity.js';
+
+const synthesizeSchema = z.object({
+  text: z.string().min(1).max(5000),
+  catId: z.string().optional(),
+  voice: z.string().optional(),
+  langCode: z.string().optional(),
+  speed: z.number().min(0.5).max(2.0).optional(),
+});
+
+/** Strict validation for audio download filename: {64-hex}.{wav|mp3} */
+const AUDIO_FILENAME_RE = /^[0-9a-f]{64}\.(wav|mp3)$/;
+
+export interface TtsRouteOptions extends FastifyPluginOptions {
+  ttsRegistry: TtsRegistry;
+  cacheDir: string;
+}
+
+export async function ttsRoutes(app: FastifyInstance, opts: TtsRouteOptions): Promise<void> {
+  const { ttsRegistry, cacheDir } = opts;
+
+  // Ensure cache directory exists
+  await mkdir(cacheDir, { recursive: true });
+
+  /**
+   * POST /api/tts/synthesize
+   * Synthesize text to speech for a cat.
+   */
+  app.post<{ Body: unknown }>('/api/tts/synthesize', async (request, reply) => {
+    // Auth gate
+    const userId = resolveUserId(request);
+    if (!userId) {
+      reply.status(401);
+      return { error: 'Identity required' };
+    }
+
+    // Validate body
+    const parsed = synthesizeSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: 'Invalid request', details: parsed.error.issues };
+    }
+    const { text, catId, voice: voiceOverride, langCode: langCodeOverride, speed: speedOverride } = parsed.data;
+
+    // Resolve voice config: explicit params > per-cat defaults
+    const catVoice = catId ? getCatVoice(catId) : getCatVoice('opus');
+    const voice = voiceOverride ?? catVoice.voice;
+    const langCode = langCodeOverride ?? catVoice.langCode;
+    const speed = speedOverride ?? catVoice.speed ?? 1.0;
+    const requestedFormat = 'wav';
+    // F066: Clone params from per-cat voice config
+    const refAudio = catVoice.refAudio;
+    const refText = catVoice.refText;
+    const instruct = catVoice.instruct;
+    const temperature = catVoice.temperature;
+
+    // Get provider
+    let provider;
+    try {
+      provider = ttsRegistry.getDefault();
+    } catch {
+      reply.status(503);
+      return { error: 'No TTS provider available' };
+    }
+
+    // Compute cache hash: includes clone params so different voices get distinct cache entries
+    const hashParts = [provider.id, provider.model, voice, langCode, String(speed), requestedFormat, text];
+    if (refAudio) hashParts.push(refAudio);
+    if (refText) hashParts.push(refText);
+    if (instruct) hashParts.push(instruct);
+    if (temperature != null) hashParts.push(String(temperature));
+    const hashInput = hashParts.join('|');
+    const hash = createHash('sha256').update(hashInput).digest('hex');
+
+    // First try cache with requested format, then try with alternate format
+    let filePath: string | undefined;
+    let cached = false;
+    for (const ext of [requestedFormat, requestedFormat === 'wav' ? 'mp3' : 'wav']) {
+      const candidatePath = path.join(cacheDir, `${hash}.${ext}`);
+      try {
+        await fsStat(candidatePath);
+        filePath = candidatePath;
+        cached = true;
+        break;
+      } catch {
+        // Not cached with this extension
+      }
+    }
+
+    if (!cached) {
+      // Synthesize
+      try {
+        const synthRequest: TtsSynthesizeRequest = {
+          text,
+          voice,
+          langCode,
+          speed,
+          format: requestedFormat,
+          ...(refAudio ? { refAudio } : {}),
+          ...(refText ? { refText } : {}),
+          ...(instruct ? { instruct } : {}),
+          ...(temperature != null ? { temperature } : {}),
+        };
+        const result = await provider.synthesize(synthRequest);
+        // Double-check: only allow known audio extensions (defense in depth)
+        const allowedFormats = new Set(['wav', 'mp3']);
+        const actualFormat = allowedFormats.has(result.format) ? result.format : requestedFormat;
+        const fname = `${hash}.${actualFormat}`;
+        filePath = path.join(cacheDir, fname);
+        await writeFile(filePath, result.audio);
+      } catch (err) {
+        request.log.error({ err, voice, langCode }, 'TTS synthesis failed');
+        reply.status(502);
+        return { error: 'TTS synthesis failed', detail: err instanceof Error ? err.message : 'unknown' };
+      }
+    }
+
+    // filePath is always set: either from cache lookup or synthesis
+    const resolvedFilename = path.basename(filePath ?? '');
+    return {
+      audioUrl: `/api/tts/audio/${resolvedFilename}`,
+    };
+  });
+
+  /**
+   * GET /api/tts/audio/:filename
+   * Auth-gated audio download (R2-P1: not served via public /uploads/).
+   */
+  app.get<{ Params: { filename: string } }>('/api/tts/audio/:filename', async (request, reply) => {
+    // Auth gate
+    const userId = resolveUserId(request);
+    if (!userId) {
+      reply.status(401);
+      return { error: 'Identity required' };
+    }
+
+    const { filename } = request.params;
+
+    // R3-P1: Strict filename validation — 64-hex hash + wav/mp3 extension
+    if (!AUDIO_FILENAME_RE.test(filename)) {
+      reply.status(400);
+      return { error: 'Invalid audio filename' };
+    }
+
+    // R3-P1: Safe path join + prefix verification
+    const resolvedPath = path.resolve(cacheDir, filename);
+    if (!resolvedPath.startsWith(path.resolve(cacheDir))) {
+      reply.status(403);
+      return { error: 'Access denied' };
+    }
+
+    // Check file exists
+    try {
+      await fsStat(resolvedPath);
+    } catch {
+      reply.status(404);
+      return { error: 'Audio not found' };
+    }
+
+    // Determine MIME type
+    const ext = path.extname(filename).slice(1);
+    const mimeType = ext === 'mp3' ? 'audio/mpeg' : 'audio/wav';
+
+    reply.header('Content-Type', mimeType);
+    reply.header('Cache-Control', 'private, max-age=86400');
+    return reply.send(createReadStream(resolvedPath));
+  });
+}

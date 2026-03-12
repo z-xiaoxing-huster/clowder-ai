@@ -1,0 +1,444 @@
+/**
+ * Codex Agent Service
+ * 使用 Codex CLI 子进程调用缅因猫 (Codex)
+ *
+ * CLI 调用方式:
+ *   codex exec --json --sandbox danger-full-access --add-dir .git --config approval_policy="on-request" "prompt"
+ *   codex exec resume SESSION_ID --json --config approval_policy="on-request" "prompt"
+ *
+ * NDJSON 事件格式:
+ *   thread.started  → session_init (含 thread_id)
+ *   item.started (command_execution) → tool_use
+ *   item.completed (agent_message) → text
+ *   item.completed (command_execution) → tool_result
+ *   item.completed (file_change) → tool_use
+ *   turn.started / turn.completed / 其余 item 事件 → 跳过
+ */
+
+import { createCatId, type CatId } from '@cat-cafe/shared';
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnCli, isCliError, isCliTimeout } from '../../../../../utils/cli-spawn.js';
+import { formatCliExitError } from '../../../../../utils/cli-format.js';
+import type { SpawnFn } from '../../../../../utils/cli-types.js';
+import { extractImagePaths } from '../providers/image-paths.js';
+import { getCatModel } from '../../../../../config/cat-models.js';
+import { getCodexApprovalPolicy, getCodexSandboxMode } from '../../../../../config/codex-cli.js';
+import { getEventAuditLog, AuditEventTypes } from '../../orchestration/EventAuditLog.js';
+import { CliRawArchive } from '../../session/CliRawArchive.js';
+import { transformCodexEvent, type CodexStreamState } from '../providers/codex-event-transform.js';
+import {
+  createCodexSessionContextSnapshotResolver,
+  type CodexSessionContextSnapshotResolver,
+} from '../providers/codex-session-context-snapshot.js';
+import {
+  extractCommandExecutionLifecycle,
+  sanitizeRawEvent,
+} from '../providers/codex-audit-hooks.js';
+import type { AuditLogSink, RawArchiveSink } from '../providers/codex-audit-hooks.js';
+import type {
+  AgentMessage,
+  AgentService,
+  AgentServiceOptions,
+  MessageMetadata,
+  TokenUsage,
+} from '../../types.js';
+
+/**
+ * Options for constructing CodexAgentService (dependency injection)
+ * F32-b: catId and model are constructor parameters
+ */
+interface CodexAgentServiceOptions {
+  /** F32-b: catId for this instance (default: 'codex') */
+  catId?: CatId;
+  /** F32-b: model override (default: resolved via getCatModel) */
+  model?: string;
+  /** Inject a custom spawn function (for testing) */
+  spawnFn?: SpawnFn;
+  /** Inject audit log sink (for testing) */
+  auditLog?: AuditLogSink;
+  /** Inject raw archive sink (for testing) */
+  rawArchive?: RawArchiveSink;
+  /** Inject session context resolver (for testing) */
+  contextSnapshotResolver?: CodexSessionContextSnapshotResolver;
+}
+
+type CodexAuthMode = 'oauth' | 'api_key' | 'auto';
+
+function getCodexAuthMode(): CodexAuthMode {
+  const raw = process.env['CODEX_AUTH_MODE']?.trim().toLowerCase();
+  if (raw === 'api_key' || raw === 'auto' || raw === 'oauth') return raw;
+  return 'oauth';
+}
+
+function applyAuthMode(env: Record<string, string>): Record<string, string | null> {
+  if (getCodexAuthMode() !== 'oauth') return env;
+
+  // OAuth-first default: explicitly delete key-based credentials from child env.
+  // spawnCli interprets `null` as "remove this key from inherited process.env".
+  return {
+    ...env,
+    OPENAI_API_KEY: null,
+    OPENAI_BASE_URL: null,
+    OPENAI_API_BASE: null,
+    OPENAI_ORG_ID: null,
+    OPENAI_ORGANIZATION: null,
+  };
+}
+
+const MAX_RECENT_STREAM_ERRORS = 5;
+const MAX_STREAM_ERROR_LENGTH = 240;
+
+function collectCodexStreamError(
+  event: unknown,
+  recentErrors: string[],
+): void {
+  if (typeof event !== 'object' || event === null) return;
+  const record = event as Record<string, unknown>;
+  if (record['type'] !== 'error') return;
+  const raw = record['message'];
+  if (typeof raw !== 'string') return;
+
+  const msg = raw.trim().slice(0, MAX_STREAM_ERROR_LENGTH);
+  if (!msg) return;
+
+  const last = recentErrors[recentErrors.length - 1];
+  if (last === msg) return;
+
+  recentErrors.push(msg);
+  if (recentErrors.length > MAX_RECENT_STREAM_ERRORS) {
+    recentErrors.shift();
+  }
+}
+
+function withRecentDiagnostics(base: string, recentErrors: string[]): string {
+  if (recentErrors.length === 0) return base;
+  const lines = recentErrors.map((line) => `- ${line}`);
+  return `${base}\n最近流错误:\n${lines.join('\n')}`;
+}
+
+function toTomlString(value: string): string {
+  const escaped = value.replace(/[\u0000-\u001f\u007f"\\]/g, (char) => {
+    switch (char) {
+      case '\\':
+        return '\\\\';
+      case '"':
+        return '\\"';
+      case '\b':
+        return '\\b';
+      case '\t':
+        return '\\t';
+      case '\n':
+        return '\\n';
+      case '\f':
+        return '\\f';
+      case '\r':
+        return '\\r';
+      default:
+        return `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`;
+    }
+  });
+  return `"${escaped}"`;
+}
+
+/**
+ * F041/F043 root fix:
+ * Ensure Codex subprocess always receives cat-cafe MCP server config
+ * based on the current thread working directory.
+ */
+function buildCatCafeMcpConfigArgs(
+  workingDirectory?: string,
+  callbackEnv?: Record<string, string>,
+): string[] {
+  const candidateRoots: string[] = [];
+  if (workingDirectory) candidateRoots.push(workingDirectory);
+  candidateRoots.push(process.cwd());
+
+  // file path: packages/api/src/domains/cats/services/agents/providers/CodexAgentService.ts
+  // repo root = dirname(fileURLToPath(import.meta.url)) up to .../cat-cafe
+  const fileDir = dirname(fileURLToPath(import.meta.url));
+  candidateRoots.push(resolve(fileDir, '../../../../../../../..'));
+
+  let serverPath: string | undefined;
+  for (const root of candidateRoots) {
+    const candidate = resolve(root, 'packages/mcp-server/dist/index.js');
+    if (existsSync(candidate)) {
+      serverPath = candidate;
+      break;
+    }
+  }
+  if (!serverPath) return [];
+
+  const args = [
+    '--config',
+    'mcp_servers.cat-cafe.command="node"',
+    '--config',
+    `mcp_servers.cat-cafe.args=[${toTomlString(serverPath)}]`,
+    '--config',
+    'mcp_servers.cat-cafe.enabled=true',
+  ];
+
+  const callbackKeys = [
+    'CAT_CAFE_API_URL',
+    'CAT_CAFE_INVOCATION_ID',
+    'CAT_CAFE_CALLBACK_TOKEN',
+    'CAT_CAFE_USER_ID',
+    'CAT_CAFE_SIGNAL_USER',
+  ] as const;
+  for (const key of callbackKeys) {
+    const value = callbackEnv?.[key];
+    if (!value) continue;
+    args.push('--config', `mcp_servers.cat-cafe.env.${key}=${toTomlString(value)}`);
+  }
+
+  return args;
+}
+
+/**
+ * Service for invoking Codex via CLI subprocess.
+ * Uses ChatGPT Plus/Pro subscription instead of API key.
+ */
+export class CodexAgentService implements AgentService {
+  readonly catId: CatId;
+  private readonly spawnFn: SpawnFn | undefined;
+  private readonly model: string;
+  private readonly auditLog: AuditLogSink;
+  private readonly rawArchive: RawArchiveSink;
+  private readonly contextSnapshotResolver: CodexSessionContextSnapshotResolver;
+
+  constructor(options?: CodexAgentServiceOptions) {
+    this.catId = options?.catId ?? createCatId('codex');
+    this.spawnFn = options?.spawnFn;
+    this.model = options?.model ?? getCatModel(this.catId as string);
+    this.auditLog = options?.auditLog ?? getEventAuditLog();
+    this.rawArchive = options?.rawArchive ?? new CliRawArchive();
+    this.contextSnapshotResolver = options?.contextSnapshotResolver ?? createCodexSessionContextSnapshotResolver();
+  }
+
+  async *invoke(
+    prompt: string,
+    options?: AgentServiceOptions
+  ): AsyncIterable<AgentMessage> {
+    // Codex CLI has no system prompt flag; prepend identity to prompt text
+    let effectivePrompt = options?.systemPrompt
+      ? `${options.systemPrompt}\n\n${prompt}`
+      : prompt;
+    const imagePaths = extractImagePaths(options?.contentBlocks, options?.uploadDir);
+    const imageArgs = imagePaths.flatMap((path) => ['--image', path]);
+
+    const sandboxMode = getCodexSandboxMode();
+    const approvalPolicy = getCodexApprovalPolicy();
+    const modelArgs = ['--model', this.model];
+    const approvalArgs = ['--config', `approval_policy="${approvalPolicy}"`];
+    const catCafeMcpArgs = buildCatCafeMcpConfigArgs(options?.workingDirectory, options?.callbackEnv);
+
+    // resume 子命令不接受 --sandbox（sandbox 在创建时已锁定）
+    // --add-dir .git: 允许写入 .git/ 目录（index.lock、objects、refs），解锁 git commit
+    // 注意：旧 session resume 时沿用创建时的沙箱参数，不会带 --add-dir。
+    // 这是预期行为——新建会话即可获得 .git 写入权限。
+    const promptArgs = ['--', effectivePrompt];
+
+    const args: string[] = options?.sessionId
+      ? [
+        'exec', 'resume', options.sessionId, '--json',
+        ...modelArgs, ...approvalArgs, ...catCafeMcpArgs, ...imageArgs, ...promptArgs,
+      ]
+      : [
+        'exec', '--json', ...modelArgs, '--sandbox', sandboxMode, '--add-dir', '.git',
+        ...approvalArgs, ...catCafeMcpArgs, ...imageArgs, ...promptArgs,
+      ];
+
+    const metadata: MessageMetadata = { provider: 'openai', model: this.model };
+    const auditContext = options?.auditContext;
+    const recentStreamErrors: string[] = [];
+
+    try {
+      // Use real HOME — project-level AGENTS.md already overrides global ~/.codex/AGENTS.md.
+      // HOME isolation was removed because Codex CLI rebuilds ~/.codex/ on startup,
+      // overwriting pre-copied auth.json/config.toml/sessions (see bug-report/tea-coffee/).
+      const codexEnv = applyAuthMode(options?.callbackEnv ?? {});
+
+      const cliOpts = {
+        command: 'codex' as const,
+        args,
+        ...(options?.workingDirectory
+          ? { cwd: options.workingDirectory }
+          : {}),
+        env: codexEnv,
+        ...(options?.signal ? { signal: options.signal } : {}),
+      };
+      const events = options?.spawnCliOverride
+        ? options.spawnCliOverride(cliOpts)
+        : spawnCli(cliOpts, this.spawnFn ? { spawnFn: this.spawnFn } : undefined);
+
+      // Track substantive output (item.completed with text/tool results).
+      // Used to suppress Codex CLI 0.98+ false exit-code-1 errors:
+      // thread.started alone is NOT substantive (just session init).
+      let sawSubstantiveOutput = false;
+      const codexStreamState: CodexStreamState = { hadPriorTextTurn: false };
+
+      for await (const event of events) {
+        collectCodexStreamError(event, recentStreamErrors);
+
+        if (auditContext) {
+          this.rawArchive.append(auditContext.invocationId, sanitizeRawEvent(event)).catch((err) => {
+            console.warn('[audit] Codex raw event archive write failed', {
+              threadId: auditContext.threadId,
+              invocationId: auditContext.invocationId,
+              err,
+            });
+          });
+        }
+
+        if (isCliTimeout(event)) {
+          yield {
+            type: 'error',
+            catId: this.catId,
+            error: `缅因猫 CLI 响应超时 (${Math.round(event.timeoutMs / 1000)}s)`,
+            metadata,
+            timestamp: Date.now(),
+          };
+          continue;
+        }
+        if (isCliError(event)) {
+          // Codex CLI 0.98+ returns exit code 1 after successful completion.
+          // Suppress the error ONLY if we saw substantive output (item.completed).
+          // thread.started alone is NOT enough — that just means session init.
+          if (event.exitCode === 1 && event.signal === null && sawSubstantiveOutput) {
+            console.warn(
+              `[codex] Codex CLI exited with code 1 after substantive output (suppressing as Codex 0.98+ quirk)`,
+            );
+            continue;
+          }
+          const base = formatCliExitError('Codex CLI', event);
+          yield {
+            type: 'error',
+            catId: this.catId,
+            error: withRecentDiagnostics(base, recentStreamErrors),
+            metadata,
+            timestamp: Date.now(),
+          };
+          continue;
+        }
+
+        // Track substantive events: item.completed produces text/tool_result/tool_use
+        if (typeof event === 'object' && event !== null) {
+          const e = event as Record<string, unknown>;
+          if (e['type'] === 'item.completed') {
+            sawSubstantiveOutput = true;
+          }
+        }
+
+        if (auditContext) {
+          const lifecycle = extractCommandExecutionLifecycle(event);
+          if (lifecycle) {
+            const type = lifecycle.phase === 'started'
+              ? AuditEventTypes.CLI_TOOL_STARTED
+              : AuditEventTypes.CLI_TOOL_COMPLETED;
+
+            this.auditLog.append({
+              type,
+              threadId: auditContext.threadId,
+              data: {
+                invocationId: auditContext.invocationId,
+                userId: auditContext.userId,
+                catId: auditContext.catId,
+                tool: 'command_execution',
+                command: lifecycle.command,
+                ...(lifecycle.status ? { status: lifecycle.status } : {}),
+                ...(lifecycle.exitCode !== undefined ? { exitCode: lifecycle.exitCode } : {}),
+              },
+            }).catch((err) => {
+              console.warn('[audit] Codex CLI tool lifecycle write failed', {
+                threadId: auditContext.threadId,
+                invocationId: auditContext.invocationId,
+                err,
+              });
+            });
+          }
+        }
+
+        // F8: Capture usage from turn.completed events (not passed through transform)
+        if (typeof event === 'object' && event !== null) {
+          const raw = event as Record<string, unknown>;
+          if (raw['type'] === 'turn.completed') {
+            const u = raw['usage'] as Record<string, unknown> | undefined;
+            if (u) {
+              const usage: TokenUsage = {};
+              if (typeof u['input_tokens'] === 'number') usage.inputTokens = u['input_tokens'];
+              if (typeof u['output_tokens'] === 'number') usage.outputTokens = u['output_tokens'];
+              if (typeof u['cached_input_tokens'] === 'number') usage.cacheReadTokens = u['cached_input_tokens'];
+              // F24-fallback: turn.completed is always available from codex exec --json.
+              // Note: Codex session token_count is a more accurate source for context fill;
+              // this value may be overwritten by contextSnapshotResolver when available.
+              if (typeof u['input_tokens'] === 'number') usage.lastTurnInputTokens = u['input_tokens'];
+              metadata.usage = usage;
+            }
+          }
+        }
+
+        const result = transformCodexEvent(event, this.catId, codexStreamState);
+        if (result !== null) {
+          if (Array.isArray(result)) {
+            for (const msg of result) {
+              if (msg.type === 'session_init' && msg.sessionId) {
+                metadata.sessionId = msg.sessionId;
+              }
+              yield { ...msg, metadata };
+            }
+          } else {
+            if (result.type === 'session_init' && result.sessionId) {
+              metadata.sessionId = result.sessionId;
+            }
+            yield { ...result, metadata };
+          }
+        }
+      }
+
+      if (metadata.sessionId) {
+        try {
+          const snapshot = await this.contextSnapshotResolver(metadata.sessionId);
+          if (snapshot) {
+            const usage: TokenUsage = metadata.usage ? { ...metadata.usage } : {};
+            usage.contextUsedTokens = snapshot.contextUsedTokens;
+            usage.contextWindowSize = snapshot.contextWindowTokens;
+            usage.lastTurnInputTokens = snapshot.contextUsedTokens;
+
+            if (snapshot.contextResetsAtMs != null) {
+              usage.contextResetsAtMs = snapshot.contextResetsAtMs;
+            }
+            if (usage.inputTokens == null && snapshot.totalInputTokens != null) {
+              usage.inputTokens = snapshot.totalInputTokens;
+            }
+            if (usage.cacheReadTokens == null && snapshot.totalCachedInputTokens != null) {
+              usage.cacheReadTokens = snapshot.totalCachedInputTokens;
+            }
+            if (usage.outputTokens == null && snapshot.totalOutputTokens != null) {
+              usage.outputTokens = snapshot.totalOutputTokens;
+            }
+
+            metadata.usage = usage;
+          }
+        } catch (err) {
+          console.warn('[codex] failed to resolve session context snapshot', {
+            sessionId: metadata.sessionId,
+            err,
+          });
+        }
+      }
+
+      yield { type: 'done', catId: this.catId, metadata, timestamp: Date.now() };
+    } catch (err) {
+      yield {
+        type: 'error',
+        catId: this.catId,
+        error: err instanceof Error ? err.message : String(err),
+        metadata,
+        timestamp: Date.now(),
+      };
+      // Guarantee done after error so invoke-single-cat can set isFinal correctly
+      yield { type: 'done', catId: this.catId, metadata, timestamp: Date.now() };
+    }
+  }
+}

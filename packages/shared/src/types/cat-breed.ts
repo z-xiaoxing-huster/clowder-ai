@@ -1,0 +1,205 @@
+/**
+ * Cat Breed & Variant Types
+ * Breed+Variant 两层 schema：Breed 是猫种（布偶/缅因/暹罗），
+ * Variant 是同一猫种下的不同模型/配置。
+ *
+ * Phase 3.5: 每 Breed 有 1 个 default Variant
+ * Phase 4-F: 支持多 Variant（多版本猫召唤）
+ */
+
+import type { CatColor, CatProvider } from './cat.js';
+import type { CatId } from './ids.js';
+import type { VoiceConfig } from './tts.js';
+
+/**
+ * Per-cat context budget configuration.
+ * Controls how much history/context is sent to each cat.
+ */
+export interface ContextBudget {
+  /** Total prompt token limit (including system prompt + context + user message) */
+  readonly maxPromptTokens: number;
+  /** Maximum tokens for historical context */
+  readonly maxContextTokens: number;
+  /** Maximum number of historical messages to include */
+  readonly maxMessages: number;
+  /** Maximum characters per single message (truncation point) */
+  readonly maxContentLengthPerMsg: number;
+}
+
+/**
+ * CLI invocation config for a variant
+ */
+export interface CliConfig {
+  readonly command: string; // 'claude' | 'codex' | 'gemini'
+  readonly outputFormat: string; // 'stream-json' | 'json'
+  readonly defaultArgs?: readonly string[];
+}
+
+/**
+ * A specific model/config variant within a breed.
+ * e.g. ragdoll breed → opus-4.6 variant, opus-4.5 variant
+ *
+ * F32-b: Variants can override catId, displayName, and mentionPatterns
+ * to register as independent cats within the same breed.
+ */
+export interface CatVariant {
+  readonly id: string; // 'opus-4.6', 'codex-default'
+  /** Override breed-level catId to register as an independent cat (F32-b) */
+  readonly catId?: string;
+  /** Override breed-level displayName (F32-b) */
+  readonly displayName?: string;
+  /** F32-b P4: Human-readable label for disambiguation (e.g. "4.5", "Sonnet") */
+  readonly variantLabel?: string;
+  /** Independent mention patterns for this variant (F32-b).
+   *  Default variant inherits breed mentionPatterns; non-default variants fallback to @catId when unspecified. */
+  readonly mentionPatterns?: readonly string[];
+  readonly provider: CatProvider;
+  readonly defaultModel: string;
+  readonly mcpSupport: boolean;
+  readonly cli: CliConfig;
+  readonly personality?: string;
+  readonly strengths?: readonly string[];
+  /** F32-b P4c: Override breed-level avatar for this variant */
+  readonly avatar?: string;
+  /** F32-b P4c: Override breed-level color for this variant */
+  readonly color?: CatColor;
+  /** Per-cat context budget (optional, falls back to defaults) */
+  readonly contextBudget?: ContextBudget;
+  /** F34: Per-cat TTS voice (optional, falls back to defaults in cat-voices.ts) */
+  readonly voiceConfig?: VoiceConfig;
+  /** F-Ground-3: Human-readable strengths for teammate roster (overrides breed-level) */
+  readonly teamStrengths?: string;
+  /** F-Ground-3: Caution note. null = explicitly no caution (overrides breed). */
+  readonly caution?: string | null;
+}
+
+/**
+ * Per-cat feature flags.
+ * Controls which subsystems are enabled for each cat.
+ */
+export interface CatFeatures {
+  /** F24: Enable session chain (context health tracking, auto-seal, bootstrap).
+   *  Default: true. Set false for cats with inaccurate token stats (e.g. Gemini). */
+  readonly sessionChain?: boolean;
+  /** F33 Phase 2: Per-breed session strategy override from cat-config.json.
+   *  Partial config — merged with provider/global defaults at runtime.
+   *  Matches SessionStrategyConfig shape (all fields except strategy are optional). */
+  readonly sessionStrategy?: {
+    readonly strategy: 'handoff' | 'compress' | 'hybrid';
+    readonly thresholds?: { readonly warn: number; readonly action: number };
+    readonly handoff?: { readonly preSealMemoryDump: boolean; readonly bootstrapDepth: 'extractive' | 'generative' };
+    readonly hybrid?: { readonly maxCompressions: number };
+    readonly compress?: { readonly maxCompressions?: number; readonly trackPostCompression: boolean };
+    readonly turnBudget?: number;
+    readonly safetyMargin?: number;
+  };
+  /** F049: Mission Hub self-claim permission ratchet scope. */
+  readonly missionHub?: {
+    /**
+     * disabled: 仅允许「建议 + 批准」
+     * once/thread/global: 允许直通 self-claim（细粒度行为由路由层定义）
+     */
+    readonly selfClaimScope?: MissionHubSelfClaimScope;
+  };
+}
+
+export type MissionHubSelfClaimScope = 'disabled' | 'once' | 'thread' | 'global';
+
+/**
+ * A cat breed — the identity layer (name, avatar, color, role).
+ * Each breed has one or more variants (model configs).
+ */
+export interface CatBreed {
+  readonly id: string; // 'ragdoll', 'maine-coon', 'siamese'
+  readonly catId: CatId;
+  readonly name: string; // '布偶猫'
+  readonly displayName: string;
+  /** Nickname given by 铲屎官. See docs/stories/cat-names/ */
+  readonly nickname?: string;
+  readonly avatar: string;
+  readonly color: CatColor;
+  readonly mentionPatterns: readonly string[];
+  readonly roleDescription: string;
+  readonly defaultVariantId: string;
+  readonly variants: readonly CatVariant[];
+  /** Per-cat feature flags (optional, all features enabled by default) */
+  readonly features?: CatFeatures;
+  /** F-Ground-3: Human-readable strengths for teammate roster (breed default) */
+  readonly teamStrengths?: string;
+  /** F-Ground-3: Caution note. null = explicitly no caution (overrides breed). */
+  readonly caution?: string | null;
+}
+
+// ── F032: Roster types for collaboration rules ─────────────────────────
+
+/**
+ * Roster entry for a single cat.
+ * F032: Used for reviewer matching, availability tracking, and role checking.
+ */
+export interface RosterEntry {
+  /** Family/species (ragdoll, maine-coon, siamese) */
+  readonly family: string;
+  /** Roles this cat can fulfill (architect, peer-reviewer, designer, etc.) */
+  readonly roles: readonly string[];
+  /** Whether this cat is the lead of its family */
+  readonly lead: boolean;
+  /** Whether this cat is available (has quota). 铲屎官 40 美刀教训！ */
+  readonly available: boolean;
+  /** 铲屎官's evaluation of this cat */
+  readonly evaluation: string;
+}
+
+/** Map of catId → RosterEntry */
+export type Roster = Record<string, RosterEntry>;
+
+/**
+ * Review policy configuration.
+ * F032: Determines how reviewers are matched to authors.
+ */
+export interface ReviewPolicy {
+  /** Require reviewer to be from a different family than author */
+  readonly requireDifferentFamily: boolean;
+  /** Prefer cats that are active in the current thread */
+  readonly preferActiveInThread: boolean;
+  /** Prefer lead cats when multiple candidates exist */
+  readonly preferLead: boolean;
+  /** Exclude cats with available: false (no quota) */
+  readonly excludeUnavailable: boolean;
+}
+
+/**
+ * Root config v1: breeds only (legacy)
+ */
+export interface CatCafeConfigV1 {
+  readonly version: 1;
+  readonly breeds: readonly CatBreed[];
+}
+
+/**
+ * F067: Owner (铲屎官) configuration — configurable identity for @ mention routing.
+ */
+export interface OwnerConfig {
+  /** Primary display name (e.g. "Landy") */
+  readonly name: string;
+  /** Alternative names cats may use (e.g. ["A.B.", "Owner"]) */
+  readonly aliases: readonly string[];
+  /** Line-start mention patterns for routing detection (e.g. ["@owner", "@owner-alias"]) */
+  readonly mentionPatterns: readonly string[];
+}
+
+/**
+ * Root config v2: breeds + roster + reviewPolicy (F032)
+ */
+export interface CatCafeConfigV2 {
+  readonly version: 2;
+  readonly breeds: readonly CatBreed[];
+  readonly roster: Roster;
+  readonly reviewPolicy: ReviewPolicy;
+  readonly owner?: OwnerConfig;
+}
+
+/**
+ * Root config: versioned, contains all breeds.
+ * Union of all versions — loader handles migration.
+ */
+export type CatCafeConfig = CatCafeConfigV1 | CatCafeConfigV2;

@@ -1,0 +1,374 @@
+'use client';
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { CatInvocationInfo } from '@/stores/chatStore';
+import { useChatStore } from '@/stores/chatStore';
+import { apiFetch } from '@/utils/api-client';
+import {
+  modeLabel, statusLabel, statusTone, truncateId,
+  type IntentMode, type CatStatus,
+} from './status-helpers';
+import { useCatData, formatCatName } from '@/hooks/useCatData';
+import { CatTokenUsage } from './CatTokenUsage';
+import { CatInvocationTime, CollapsibleIds } from './status-panel-parts';
+import { SessionChainPanel } from './SessionChainPanel';
+import { PlanBoardPanel } from './PlanBoardPanel';
+import { AuditExplorerPanel } from './audit/AuditExplorerPanel';
+
+export interface RightStatusPanelProps {
+  intentMode: IntentMode;
+  targetCats: string[];
+  catStatuses: Record<string, CatStatus>;
+  catInvocations: Record<string, CatInvocationInfo>;
+  threadId: string;
+  messageSummary: {
+    total: number;
+    assistant: number;
+    system: number;
+    evidence: number;
+    followup: number;
+  };
+}
+
+/* ── Cat invocation card (shared between active/history) ──── */
+function CatInvocationCard({
+  catId, inv, onCopy, isActive,
+}: {
+  catId: string;
+  inv: CatInvocationInfo;
+  onCopy: (v: string) => void;
+  isActive: boolean;
+}) {
+  const { getCatById } = useCatData();
+  const cat = getCatById(catId);
+  const dotColor = cat?.color.primary ?? '#9CA3AF';
+  return (
+    <div className="text-xs">
+      <div className="flex items-center gap-1.5 mb-1">
+        <span
+          className={`inline-block h-2.5 w-2.5 rounded-full ${isActive ? 'animate-pulse' : ''}`}
+          style={{ backgroundColor: dotColor }}
+        />
+        <span className="font-medium text-gray-700">{cat ? formatCatName(cat) : catId}</span>
+        {inv.sessionSeq !== undefined && (
+          <span
+            className={`text-[10px] px-1 py-0.5 rounded ${
+              inv.sessionSealed ? 'bg-amber-100 text-amber-600' : 'bg-gray-100 text-gray-500'
+            }`}
+            title={inv.sessionSealed ? `会话 #${inv.sessionSeq} 已封存` : `会话 #${inv.sessionSeq}`}
+          >
+            S#{inv.sessionSeq}{inv.sessionSealed ? ' sealed' : ''}
+          </span>
+        )}
+        <CatInvocationTime invocation={inv} />
+      </div>
+      {inv.usage && (
+        <div className="ml-3.5">
+          <CatTokenUsage catId={catId} usage={inv.usage} contextHealth={inv.contextHealth} />
+        </div>
+      )}
+      {(inv.sessionId || inv.invocationId) && (
+        <CollapsibleIds sessionId={inv.sessionId} invocationId={inv.invocationId} onCopy={onCopy} />
+      )}
+    </div>
+  );
+}
+
+/** Toggle between play/debug thinking visibility mode for the thread */
+function ThinkingModeToggle({ threadId }: { threadId: string }) {
+  const thread = useChatStore((s) => s.threads.find((t) => t.id === threadId));
+  const updateLocal = useChatStore((s) => s.updateThreadThinkingMode);
+  const mode = thread?.thinkingMode ?? 'debug';
+  const isDebug = mode === 'debug';
+  const pendingRef = useRef(false);
+
+  const toggle = useCallback(async () => {
+    if (pendingRef.current) return;
+    pendingRef.current = true;
+    const next = isDebug ? 'play' : 'debug';
+    updateLocal(threadId, next);
+    try {
+      const res = await apiFetch(`/api/threads/${threadId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thinkingMode: next }),
+      });
+      if (!res.ok) {
+        updateLocal(threadId, mode);
+      }
+    } catch {
+      // Revert on network failure
+      updateLocal(threadId, mode);
+    } finally {
+      pendingRef.current = false;
+    }
+  }, [threadId, isDebug, mode, updateLocal]);
+
+  return (
+    <div className="flex items-center justify-between">
+      <span>心里话: <span className="font-medium">{isDebug ? '🔍 调试' : '🎭 游戏'}</span></span>
+      <button
+        onClick={toggle}
+        className="text-[11px] px-2 py-0.5 rounded-full border border-gray-300 hover:border-gray-400 hover:bg-gray-100 transition-colors"
+        title={isDebug ? '切换到游戏模式（猫猫互相看不到心里话）' : '切换到调试模式（猫猫互相分享心里话）'}
+      >
+        {isDebug ? '切换游戏' : '切换调试'}
+      </button>
+    </div>
+  );
+}
+
+
+/** Global UI preference: default expand/collapse for Thinking blocks */
+function ThinkingDefaultExpandToggle() {
+  const expanded = useChatStore((s) => s.uiThinkingExpandedByDefault);
+  const setExpanded = useChatStore((s) => s.setUiThinkingExpandedByDefault);
+  const toggle = useCallback(() => setExpanded(!expanded), [expanded, setExpanded]);
+
+  return (
+    <div className="flex items-center justify-between">
+      <span>Thinking 默认: <span className="font-medium">{expanded ? '📖 展开' : '🧻 折叠'}</span></span>
+      <button
+        onClick={toggle}
+        className="text-[11px] px-2 py-0.5 rounded-full border border-gray-300 hover:border-gray-400 hover:bg-gray-100 transition-colors"
+        title={expanded ? '切换为默认折叠（减少滚动）' : '切换为默认展开（便于调试）'}
+      >
+        {expanded ? '默认折叠' : '默认展开'}
+      </button>
+    </div>
+  );
+}
+
+/** F35: Reveal all whispers in the thread (game-end reveal) */
+function RevealWhispersButton({ threadId }: { threadId: string }) {
+  const [status, setStatus] = useState<'idle' | 'pending' | 'done'>('idle');
+  const [revealedCount, setRevealedCount] = useState<number | null>(null);
+
+  // Reset state when switching threads
+  useEffect(() => {
+    setStatus('idle');
+    setRevealedCount(null);
+  }, [threadId]);
+
+  const handleReveal = useCallback(async () => {
+    if (status === 'pending') return;
+    setStatus('pending');
+    // Capture cutoff before PATCH so whispers arriving mid-flight aren't falsely marked
+    const revealCutoff = Date.now();
+    try {
+      const res = await apiFetch(`/api/threads/${threadId}/reveal`, {
+        method: 'PATCH',
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const count = data.revealed ?? 0;
+        setRevealedCount(count);
+        setStatus('done');
+        // Update local chat store so whisper bubbles re-render as revealed
+        if (count > 0) {
+          useChatStore.setState((state) => ({
+            messages: state.messages.map((m) =>
+              m.visibility === 'whisper' && !m.revealedAt && (m.timestamp ?? 0) <= revealCutoff
+                ? { ...m, revealedAt: revealCutoff }
+                : m,
+            ),
+          }));
+        }
+        // Reset to idle after a delay so new whispers can be revealed later
+        setTimeout(() => setStatus('idle'), 3000);
+      } else {
+        setStatus('idle');
+      }
+    } catch {
+      setStatus('idle');
+    }
+  }, [threadId, status]);
+
+  return (
+    <div className="flex items-center justify-between">
+      <span>悄悄话:</span>
+      {status === 'done' ? (
+        <span className="text-[11px] text-green-600">
+          已揭秘 {revealedCount} 条
+        </span>
+      ) : (
+        <button
+          onClick={handleReveal}
+          disabled={status === 'pending'}
+          className="text-[11px] px-2 py-0.5 rounded-full border border-amber-300 text-amber-600 hover:border-amber-400 hover:bg-amber-50 transition-colors disabled:opacity-50"
+          title="揭晓本线程所有悄悄话"
+        >
+          {status === 'pending' ? '揭秘中...' : '揭秘全部'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+export function RightStatusPanel({
+  intentMode,
+  targetCats,
+  catStatuses,
+  catInvocations,
+  threadId,
+  messageSummary,
+}: RightStatusPanelProps) {
+  // F26: Split into active (working now) vs history (appeared before)
+  const { activeCats, historyCats } = useMemo(() => {
+    const snapshotCats = Object.entries(catInvocations)
+      .filter(([, inv]) => {
+        const taskProgress = inv.taskProgress;
+        if (!taskProgress || taskProgress.tasks.length === 0) return false;
+        return taskProgress.snapshotStatus !== 'completed';
+      })
+      .map(([catId]) => catId);
+    const active = Array.from(new Set([...targetCats, ...snapshotCats]));
+    const allParticipants = new Set([
+      ...active,
+      ...Object.keys(catInvocations),
+    ]);
+    const history = [...allParticipants].filter((c) => !active.includes(c));
+    return { activeCats: active, historyCats: history };
+  }, [targetCats, catInvocations]);
+
+  const { getCatById } = useCatData();
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [viewSessionId, setViewSessionId] = useState<string | null>(null);
+
+  // Clear session viewer when switching threads
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally reset on threadId change only
+  React.useEffect(() => {
+    setViewSessionId(null);
+  }, [threadId]);
+
+  const openHub = useChatStore((s) => s.openHub);
+
+  const copyText = useCallback((value: string) => {
+    void navigator.clipboard.writeText(value);
+  }, []);
+
+  return (
+    <aside className="hidden lg:flex w-72 border-l border-owner-light bg-white/90 px-4 py-4 flex-col gap-4 overflow-y-auto">
+      <div>
+        <h2 className="text-sm font-bold text-cafe-black">状态栏</h2>
+        <p className="text-xs text-gray-500 mt-1">
+          当前模式: <span className="font-medium">{modeLabel(intentMode)}</span>
+        </p>
+      </div>
+
+      {/* ── Active cats: currently working ──────────────── */}
+      <section className="rounded-lg border border-gray-200 bg-gray-50/70 p-3">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-xs font-semibold text-gray-700">
+            {activeCats.length > 0 ? '当前调用' : '猫猫状态'}
+          </h3>
+          <button
+            onClick={() => openHub()}
+            className="text-base text-gray-400 hover:text-blue-600 hover:rotate-45 transition-all duration-200"
+            title="Cat Café Hub"
+          >
+            &#9881;
+          </button>
+        </div>
+        {activeCats.length > 0 ? (
+          <div className="space-y-3">
+            {activeCats.map((catId) => {
+              const cat = getCatById(catId);
+              const dotColor = cat?.color.primary ?? '#9CA3AF';
+              const status = catStatuses[catId] ?? 'pending';
+              const inv = catInvocations[catId];
+              return (
+                <div key={catId}>
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: dotColor }} />
+                      <span className="text-xs text-gray-700">{cat ? formatCatName(cat) : catId}</span>
+                    </div>
+                    <span className={`text-xs font-medium ${statusTone(status)}`}>
+                      {statusLabel(status)}
+                    </span>
+                  </div>
+                  {inv && (
+                    <CatInvocationCard catId={catId} inv={inv} onCopy={copyText} isActive />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="text-xs text-gray-400">空闲</div>
+        )}
+      </section>
+
+      {/* ── History cats: appeared before but not in current round ── */}
+      {historyCats.length > 0 && (
+        <section className="rounded-lg border border-gray-200 bg-gray-50/70 p-3">
+          <button
+            onClick={() => setHistoryOpen((v) => !v)}
+            className="w-full flex items-center justify-between text-xs font-semibold text-gray-500 hover:text-gray-700"
+          >
+            <span>历史参与 ({historyCats.length})</span>
+            <span className="text-[10px]">{historyOpen ? '▲' : '▼'}</span>
+          </button>
+          {historyOpen && (
+            <div className="mt-2 space-y-2">
+              {historyCats.map((catId) => {
+                const inv = catInvocations[catId];
+                if (!inv) {
+                  const cat = getCatById(catId);
+                  return (
+                    <div key={catId} className="flex items-center gap-2 text-xs text-gray-400">
+                      <span className="inline-block h-2 w-2 rounded-full opacity-50" style={{ backgroundColor: cat?.color.primary ?? '#9CA3AF' }} />
+                      {cat ? formatCatName(cat) : catId}
+                    </div>
+                  );
+                }
+                return <CatInvocationCard key={catId} catId={catId} inv={inv} onCopy={copyText} isActive={false} />;
+              })}
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* ── Message stats (collapsible) ───────────────── */}
+      <section className="rounded-lg border border-gray-200 bg-gray-50/70 p-3">
+        <h3 className="text-xs font-semibold text-gray-700 mb-2">消息统计</h3>
+        <div className="grid grid-cols-2 gap-2 text-xs text-gray-700">
+          <div>总数</div>
+          <div className="text-right font-medium">{messageSummary.total}</div>
+          <div>猫猫消息</div>
+          <div className="text-right font-medium">{messageSummary.assistant}</div>
+          <div>系统消息</div>
+          <div className="text-right font-medium">{messageSummary.system}</div>
+          <div>Evidence</div>
+          <div className="text-right font-medium">{messageSummary.evidence}</div>
+          <div>Follow-up</div>
+          <div className="text-right font-medium">{messageSummary.followup}</div>
+        </div>
+      </section>
+
+      <PlanBoardPanel threadId={threadId} catInvocations={catInvocations} />
+
+      <SessionChainPanel threadId={threadId} catInvocations={catInvocations} onViewSession={setViewSessionId} />
+
+      <section className="rounded-lg border border-gray-200 bg-gray-50/70 p-3">
+        <h3 className="text-xs font-semibold text-gray-700 mb-2">对话信息</h3>
+        <div className="text-xs text-gray-500 space-y-2">
+          <div>
+            Thread: <button
+              className="text-gray-600 font-mono hover:text-gray-800 cursor-pointer transition-colors"
+              title={`点击复制: ${threadId}`}
+              onClick={() => copyText(threadId)}
+            >{truncateId(threadId, 12)}</button>
+          </div>
+          <ThinkingDefaultExpandToggle />
+          <ThinkingModeToggle threadId={threadId} />
+
+          <RevealWhispersButton threadId={threadId} />
+        </div>
+      </section>
+
+      <AuditExplorerPanel key={threadId} threadId={threadId} externalSessionId={viewSessionId} onCloseSession={() => setViewSessionId(null)} />
+    </aside>
+  );
+}
